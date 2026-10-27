@@ -1,0 +1,25 @@
+# Local environment
+.env
+.env.*
+**/.env
+**/.env.*
+
+# Local Supabase schema snapshots / setup files
+supabase/
+
+# Test artifacts and QA files
+**/__tests__/
+server/test_*.mjs
+app/run_tests.mjs
+
+# Node / Expo / build output
+node_modules/
+**/node_modules/
+.expo/
+**/.expo/
+dist/
+web-build/
+
+# OS / editor noise
+.DS_Store
+Thumbs.db

@@ -1,0 +1,49 @@
+{
+  "expo": {
+    "name": "Deochipei",
+    "slug": "deochipei",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "automatic",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.deochipei"
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#E6F4FE",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": false,
+      "package": "com.deochipei"
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "scheme": "deochipei",
+    "experiments": {
+      "reactCompiler": true
+    },
+    "plugins": [
+      "expo-router",
+      [
+        "expo-image-picker",
+        {
+          "cameraPermission": "Deochipei uses the camera to scan receipts and trip invite QR codes.",
+          "photosPermission": "Deochipei reads photos of receipts you pick."
+        }
+      ],
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Deochipei uses the camera to scan receipts and trip invite QR codes.",
+          "microphonePermission": false,
+          "recordAudioAndroid": false
+        }
+      ]
+    ]
+  }
+}
