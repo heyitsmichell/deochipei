@@ -5,7 +5,8 @@ import {
   type NetBalance,
   type SettlementOptimizer,
 } from "./settlement";
-import { computeShares } from "./split";
+import { computeShares, shareWeights } from "./split";
+import { isISODate } from "./receiptScan";
 import type { Expense, Trip } from "./types";
 
 export interface Balance {
@@ -99,7 +100,7 @@ export class Ledger {
       throw new Error(`Invalid expense ${e.id}`);
     }
     const total = toMinor(baseAmount(e), this.currency);
-    const weights = new Map(Object.entries(computeShares(e)));
+    const weights = shareWeights(computeShares(e));
     // Split the rounded total itself, so the shares always add up to what was paid.
     const shares = weights.size ? allocate(total, weights) : new Map([[e.paidBy, total]]);
 
@@ -165,4 +166,38 @@ export class Ledger {
     to: t.to,
     amount: this.major(t.minor),
   });
+}
+
+export interface InvalidExpense {
+  index: number;
+  id?: string;
+  description: string;
+  value: unknown;
+}
+
+function invalidExpense(value: unknown, index: number): InvalidExpense {
+  const record = value && typeof value === "object" ? value as Partial<Expense> : undefined;
+  return { index, value,
+    id: typeof record?.id === "string" && record.id ? record.id : undefined,
+    description: typeof record?.description === "string" ? record.description : "",
+  };
+}
+
+/** Keep a broken historical record visible for repair without publishing partial totals. */
+export function inspectLedger(trip: Trip): { ledger?: Ledger; invalid: InvalidExpense[] } {
+  const invalid: InvalidExpense[] = [];
+  trip.expenses.forEach((expense, index) => {
+    try {
+      if (!expense || typeof expense.id !== "string" || !expense.id || !isISODate(expense.date) ||
+          typeof expense.description !== "string" || !expense.paidBy ||
+          !/^[A-Z]{3}$/.test(expense.currency) || !Array.isArray(expense.split?.memberIds)) {
+        invalid.push(invalidExpense(expense, index));
+        return;
+      }
+      new Ledger({ ...trip, expenses: [expense] });
+    } catch { invalid.push(invalidExpense(expense, index)); }
+  });
+  if (invalid.length) return { invalid };
+  try { return { ledger: new Ledger(trip), invalid }; }
+  catch { return { invalid: trip.expenses.map(invalidExpense) }; }
 }

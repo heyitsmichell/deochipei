@@ -13,6 +13,8 @@ export interface QueuedReceipt {
   id: string;
   tripId: string;
   imageUri: string;
+  /** Original picker URI, used to retry a failed queue write without moving the photo twice. */
+  sourceUri?: string;
   capturedAt: number;
   /** Local date the photo was taken, used if the receipt's own date can't be read. */
   capturedOn: string;
@@ -38,7 +40,7 @@ export interface QueuedReceipt {
 }
 
 export interface ReceiptQueueDeps {
-  repo: Pick<TripRepository, "ready" | "getTrip" | "meFor" | "saveExpense" | "saved" | "getSnapshot" | "refresh">;
+  repo: Pick<TripRepository, "ready" | "getTrip" | "meFor" | "saveExpense" | "saved" | "getSnapshot" | "refresh" | "canSync" | "hasUnverifiedTrip">;
   network: NetworkMonitor;
   storage: KeyValueStorage;
   files: ReceiptFileStore;
@@ -82,7 +84,6 @@ export class ReceiptQueue {
     private readonly retryMs = 30000,
   ) {
     this.writer = new CoalescedWriter(deps.storage, storageKey, () => this.items, () => {
-      this.persistenceUnavailable = false;
       this.emit();
     });
   }
@@ -101,7 +102,7 @@ export class ReceiptQueue {
   ready = () => (this.loading ??= this.load());
 
   /** Resolves once every change so far has been written to storage. */
-  saved = () => this.writer.saved();
+  saved = () => this.persistenceUnavailable ? Promise.reject(new Error("Receipt storage is unavailable.")) : this.writer.saved();
 
   /** Idempotent: safe under React StrictMode's double effects. */
   start() {
@@ -131,11 +132,19 @@ export class ReceiptQueue {
     await this.ready();
     const trip = this.deps.repo.getTrip(tripId);
     if (!trip) throw new Error("Trip not found on this device.");
+    const existing = this.items.find((item) => item.tripId === tripId && (item.sourceUri === photoUri || item.imageUri === photoUri));
+    if (existing) {
+      if (!this.persistenceUnavailable) this.writer.save();
+      await this.saved();
+      this.process();
+      return existing;
+    }
     const id = newId();
     const item: QueuedReceipt = {
       id,
       tripId,
       imageUri: await this.deps.files.keep(photoUri, id),
+      sourceUri: photoUri,
       capturedAt: Date.now(),
       capturedOn: todayISO(),
       paidBy: opts.paidBy ?? this.deps.repo.meFor(tripId) ?? trip.members[0]?.id ?? "",
@@ -145,6 +154,7 @@ export class ReceiptQueue {
       attempts: 0,
     };
     this.update((items) => [...items, item]);
+    await this.saved();
     this.process();
     return item;
   };
@@ -172,11 +182,16 @@ export class ReceiptQueue {
   };
 
   /** Drops a receipt and its photo, e.g. once it has been entered by hand. */
-  discard = (id: string) => {
+  discard = async (id: string) => {
     const item = this.items.find((i) => i.id === id);
     if (!item) return;
-    this.deps.files.remove(item.imageUri);
     this.update((items) => items.filter((i) => i.id !== id));
+    try { await this.saved(); }
+    catch (error) {
+      this.update((items) => items.some((candidate) => candidate.id === id) ? items : [...items, item]);
+      throw error;
+    }
+    await this.deps.files.remove(item.imageUri);
   };
 
   /**
@@ -225,10 +240,12 @@ export class ReceiptQueue {
       this.persistenceUnavailable = true;
     }
     // Receipts for trips removed from this device in the meantime have nowhere to go.
-    const kept = saved.filter((i) => this.deps.repo.getTrip(i.tripId));
+    const kept = saved.filter((i) => this.deps.repo.getTrip(i.tripId) || this.deps.repo.hasUnverifiedTrip(i.tripId));
     for (const item of saved) if (!kept.includes(item)) this.deps.files.remove(item.imageUri);
     // A receipt still "reading" means the app was closed mid-scan: start it over.
-    this.update(() => kept.map((i) => (i.status === "reading" ? { ...i, status: "waiting" } : i)));
+    this.update(() => kept.map((i) => this.deps.repo.hasUnverifiedTrip(i.tripId)
+      ? { ...i, status: "failed", error: "Join this trip again, then review and retry this receipt." }
+      : i.status === "reading" ? { ...i, status: "waiting" } : i));
   }
 
   private async drainWhileAsked() {
@@ -248,7 +265,7 @@ export class ReceiptQueue {
       try {
         outcome = await this.read(item);
       } catch (error) {
-        if (this.has(item.id)) {
+        if (this.items.find((candidate) => candidate.id === item.id)?.status === "reading") {
           this.patch(item.id, {
             status: "waiting",
             error: error instanceof Error ? error.message : "Could not finish reading this receipt.",
@@ -262,6 +279,8 @@ export class ReceiptQueue {
   }
 
   private mayRead(item: QueuedReceipt) {
+    if (this.deps.repo.hasUnverifiedTrip(item.tripId)) return false;
+    if (this.deps.repo.getTrip(item.tripId)?.syncEnabled && !this.deps.repo.canSync()) return false;
     const { connected, cellular } = this.deps.network.current();
     if (!connected || (item.retryAt ?? 0) > Date.now()) return false;
     return !cellular || item.allowCellular || this.settings.scanQueuedOnCellular;
@@ -271,7 +290,7 @@ export class ReceiptQueue {
   private async read(item: QueuedReceipt): Promise<Outcome> {
     const trip = this.deps.repo.getTrip(item.tripId);
     if (!trip) {
-      this.discard(item.id);
+      await this.discard(item.id);
       return "next";
     }
     this.patch(item.id, { status: "reading" });
@@ -284,6 +303,7 @@ export class ReceiptQueue {
       } catch {
         return this.fail(item, "The photo is no longer on this device.");
       }
+      if (!this.canFinish(item.id)) return "next";
       try {
         scan = await this.deps.scan(image, this.settings.receiptLanguage);
       } catch (err) {
@@ -295,7 +315,7 @@ export class ReceiptQueue {
         this.patch(item.id, { status: "waiting" });
         return "stop";
       }
-      if (!this.has(item.id)) return "next"; // Discarded while it was being read.
+      if (!this.canFinish(item.id)) return "next"; // Discarded while it was being read.
       this.patch(item.id, { scan });
     }
 
@@ -316,11 +336,12 @@ export class ReceiptQueue {
         return this.retryLater(item, `Couldn't get a ${scan.currency} → ${trip.baseCurrency} rate.`, "skip");
       }
     }
-    if (!this.has(item.id)) return "next";
+    if (!this.canFinish(item.id)) return "next";
 
     if (!item.addAnyway) {
       // Someone may have added this receipt while the photo waited: check the latest copy of the trip.
       await this.deps.repo.refresh(trip.id);
+      if (!this.canFinish(item.id)) return "next";
       let match: DuplicateMatch | null;
       try {
         match = await this.deps.findDuplicate(this.deps.repo.getTrip(trip.id) ?? trip, scan, rateToBase, item.id);
@@ -335,7 +356,7 @@ export class ReceiptQueue {
           return "stop";
         }
       }
-      if (!this.has(item.id)) return "next";
+      if (!this.canFinish(item.id)) return "next";
       if (match) {
         this.patch(item.id, { status: "duplicate", duplicate: match, error: undefined });
         return "next";
@@ -346,10 +367,12 @@ export class ReceiptQueue {
     try {
       await this.deps.repo.saved();
     } catch {
+      if (!this.canFinish(item.id)) return "next";
       this.patch(item.id, { status: "waiting", error: "Could not save this expense locally. It will retry." });
       return "stop";
     }
-    this.discard(item.id);
+    if (!this.canFinish(item.id)) return "next";
+    await this.discard(item.id);
     return "next";
   }
 
@@ -367,6 +390,18 @@ export class ReceiptQueue {
     const retryAt = Date.now() + this.retryMs * 2 ** (attempts - 1);
     this.patch(item.id, { status: "waiting", error, attempts, retryAt });
     return outcome;
+  }
+
+  private canFinish(id: string) {
+    const item = this.items.find((candidate) => candidate.id === id);
+    if (!item || item.status !== "reading" || this.deps.repo.hasUnverifiedTrip(item.tripId)) return false;
+    const trip = this.deps.repo.getTrip(item.tripId);
+    if (!trip) return false;
+    if (trip.syncEnabled && !this.deps.repo.canSync()) {
+      this.patch(id, { status: "waiting" });
+      return false;
+    }
+    return true;
   }
 
   private has(id: string) {
@@ -390,8 +425,15 @@ export class ReceiptQueue {
     for (const listener of this.listeners) listener();
   }
 
-  clearForAccount = async () => {
-    const keep = this.items.filter((item) => !this.deps.repo.getTrip(item.tripId)?.syncEnabled);
+  clearForAccount = async (mode: "reset" | "migrate" = "reset") => {
+    await this.ready();
+    if (mode === "migrate") {
+      this.update((items) => items.map((item) => this.deps.repo.hasUnverifiedTrip(item.tripId)
+        ? { ...item, status: "failed", error: "Join this trip again, then review and retry this receipt." } : item));
+      await this.saved();
+      return;
+    }
+    const keep = this.items.filter((item) => this.deps.repo.hasUnverifiedTrip(item.tripId) || !this.deps.repo.getTrip(item.tripId)?.syncEnabled);
     const pending = this.items.filter((item) => !keep.includes(item));
     this.items = keep;
     this.persistenceUnavailable = false;

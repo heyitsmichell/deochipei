@@ -1,7 +1,8 @@
+import { Alert } from "../lib/alert";
 import * as Clipboard from "expo-clipboard";
 import * as Linking from "expo-linking";
 import { useState } from "react";
-import { Alert, Modal, ScrollView, Share, Text, View } from "react-native";
+import { Modal, ScrollView, Share, Text, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useAuth } from "../context/AuthContext";
 import { INVITE_URL } from "../lib/api";

@@ -2,6 +2,7 @@ import express, { type NextFunction, type Request, type Response } from "express
 import path from "node:path";
 import OpenAI from "openai";
 import { z } from "zod";
+import { ExpenseSchema } from "./expense.js";
 import { requireAuth } from "./auth.js";
 import { DuplicateCheckSchema, judgeDuplicate } from "./duplicates.js";
 import { androidAssetLinks, appleAppSiteAssociation, invitePage, isValidInviteCode } from "./invite.js";
@@ -22,7 +23,7 @@ app.use((req: Request, res: Response, next: NextFunction) => {
   res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, If-None-Match");
   if (req.method === "OPTIONS") {
     return res.sendStatus(204);
   }
@@ -129,11 +130,6 @@ const MemberSchema = z.object({
   email: z.string().optional(),
   avatarUrl: z.string().optional(),
 });
-const ExpenseSchema = z.looseObject({
-  id: z.string().min(1),
-  updatedAt: z.number().finite(),
-  amount: z.number().finite().positive(),
-});
 
 function notFound(res: Response) {
   res.status(404).json({ error: "Trip not found" });
@@ -141,6 +137,7 @@ function notFound(res: Response) {
 
 function publicJoinTrip(trip: Trip) {
   return {
+    preview: true,
     id: trip.id,
     code: trip.code,
     name: trip.name,
@@ -276,7 +273,8 @@ app.post("/api/join/:code", joinRateLimiter, requireAuth, smallJson, async (req:
       return res.status(409).json({ error: err instanceof Error ? err.message : "Member is already claimed" });
     }
   }
-  return res.json(publicJoinTrip(trip));
+  return res.json(trip.ownerId === req.user!.id || trip.members.some((member) => member.userId === req.user!.id)
+    ? trip : publicJoinTrip(trip));
 });
 
 app.patch("/api/trips/:id", requireAuth, async (req: Request, res: Response) => {

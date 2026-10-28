@@ -1,12 +1,13 @@
+import { Alert } from "../../../lib/alert";
 import { router, Stack, useFocusEffect, useLocalSearchParams } from "expo-router";
 import { memo, useCallback, useMemo, useState } from "react";
-import { Alert, FlatList, Image, Pressable, Text, View, type ListRenderItem } from "react-native";
+import { FlatList, Image, Pressable, Text, View, type ListRenderItem } from "react-native";
 import { InviteSheet } from "../../../components/InviteSheet";
 import { PendingReceipts } from "../../../components/PendingReceipts";
 import { Banner, Button, Card, Chip, CurrencyPicker, Input, useTheme } from "../../../components/ui";
 import { useAuth } from "../../../context/AuthContext";
 import type { HomeCurrencyView } from "../../../lib/homeCurrency";
-import { baseAmount, Ledger, type SettlementPlan, type Transfer } from "../../../lib/ledger";
+import { baseAmount, inspectLedger, type Ledger, type SettlementPlan, type Transfer } from "../../../lib/ledger";
 import { formatMoney } from "../../../lib/money";
 import { pickReceiptImage } from "../../../lib/receiptImage";
 import { categoryIcon, type Expense, type Trip } from "../../../lib/types";
@@ -19,6 +20,7 @@ import {
   useSyncError,
   usePendingCount,
   useFailedCount,
+  useRecoveredCount,
   useTrip,
   useTripActions,
 } from "../../../state/TripsContext";
@@ -59,12 +61,38 @@ export default function TripScreen() {
 }
 
 function TripView({ trip }: { trip: Trip }) {
+  const { styles } = useTheme();
+  const { removeDamagedExpense, saveChanges } = useTripActions();
+  const result = useMemo(() => inspectLedger(trip), [trip]);
+  if (result.ledger) return <TripContent trip={trip} ledger={result.ledger} />;
+  return <View style={[styles.screen, styles.content]}>
+    <Text style={styles.h2}>An expense needs correction</Text>
+    <Text style={styles.muted}>Totals and settlements are unavailable until damaged expenses are removed and entered again. Other expenses are still kept.</Text>
+    {result.invalid.map((expense) => <Card key={expense.index}>
+      <Text style={styles.h2}>{expense.description || "Damaged expense"}</Text>
+      <Text style={styles.muted}>Record: {expense.id ?? `entry ${expense.index + 1}`}</Text>
+      <Button title={expense.id && trip.syncEnabled ? "Repair shared expense" : "Remove damaged expense"} variant="danger" onPress={() => Alert.alert("Repair damaged expense?",
+        expense.id && trip.syncEnabled
+          ? "An intact server copy will be restored. If the server copy is also damaged, the expense will be removed for everyone. Unsent edits to this expense will be discarded. Keep any details you need before confirming."
+          : "Keep any details you need, then enter the expense again.", [
+        { text: "Cancel", style: "cancel" },
+        { text: "Remove", style: "destructive", onPress: async () => {
+          try { await removeDamagedExpense(trip.id, expense.index, expense.value); await saveChanges(); }
+          catch (error) { Alert.alert("Couldn't save the removal", error instanceof Error ? error.message : "Try again."); }
+        } },
+      ])} />
+    </Card>)}
+  </View>;
+}
+
+function TripContent({ trip, ledger }: { trip: Trip; ledger: Ledger }) {
   const { colors, styles } = useTheme();
-  const { addMember, removeTripLocally, setMe, setHomeCurrency, queueReceipt, retryFailed, discardFailed } = useTripActions();
+  const { addMember, removeTripLocally, claimTripMember, setHomeCurrency, queueReceipt, retryFailed, discardFailed } = useTripActions();
   const { user, displayName: authName, avatarUrl: authAvatar } = useAuth();
   const me = useMe(trip.id);
   const pending = usePendingCount(trip.id);
   const failed = useFailedCount(trip.id);
+  const recovered = useRecoveredCount(trip.id);
   const online = useOnline();
   const syncError = useSyncError(trip.id);
   const storageError = useStorageError();
@@ -76,7 +104,6 @@ function TripView({ trip }: { trip: Trip }) {
   const [inviting, setInviting] = useState(false);
 
   // One pass over the expenses per trip version; the plan is computed lazily.
-  const ledger = useMemo(() => new Ledger(trip), [trip]);
   // Everything is accounted in the trip currency and shown in this person's own.
   const { view, home, rateInfo } = useHomeCurrency(trip);
 
@@ -146,8 +173,10 @@ function TripView({ trip }: { trip: Trip }) {
             ? "Local storage is unavailable; changes will not survive until it recovers."
             : syncError
             ? syncError
+            : recovered
+              ? "Recovered offline changes need review. Retry to send your changes, or discard to use the server copy."
             : failed
-              ? `${failed} change${failed === 1 ? "" : "s"} was rejected by the server. Review it while online.`
+              ? `${failed} change${failed === 1 ? " was" : "s were"} rejected by the server. Review ${failed === 1 ? "it" : "them"} while online.`
               : online
                 ? `Syncing ${pending} change${pending === 1 ? "" : "s"}…`
                 : `Offline${pending ? ` — ${pending} change${pending === 1 ? "" : "s"} waiting to sync` : ""}. ` +
@@ -156,8 +185,8 @@ function TripView({ trip }: { trip: Trip }) {
       )}
       {failed > 0 && (
         <View style={{ flexDirection: "row", gap: 8, marginBottom: 10 }}>
-          <Button title="Retry rejected changes" variant="secondary" onPress={() => retryFailed(trip.id)} style={{ flex: 1 }} />
-          <Button title="Discard" variant="ghost" onPress={() => void discardFailed(trip.id)} style={{ flex: 0.5 }} />
+          <Button title="Retry changes" variant="secondary" onPress={() => retryFailed(trip.id)} style={{ flex: 1 }} />
+          <Button title="Discard" variant="ghost" onPress={() => void discardFailed(trip.id).catch((error) => Alert.alert("Couldn’t discard changes", error instanceof Error ? error.message : "Try again while online."))} style={{ flex: 0.5 }} />
         </View>
       )}
 
@@ -317,9 +346,9 @@ function TripView({ trip }: { trip: Trip }) {
                         key={m.id}
                         label={`${m.name}${ownerBadge}${currencySuffix}`}
                         selected={m.id === me}
-                        onPress={() => setMe(trip.id, m.id, user?.id ? {
+                        onPress={() => void claimTripMember(trip.id, m.id, user?.id ? {
                           id: user.id, email: user.email, avatarUrl: authAvatar,
-                        } : undefined)}
+                        } : undefined).catch((error) => Alert.alert("Couldn’t select member", error instanceof Error ? error.message : "Try again while online."))}
                       />
                     );
                   })}

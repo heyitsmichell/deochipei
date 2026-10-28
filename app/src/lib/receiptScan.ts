@@ -9,6 +9,26 @@ export const isISODate = (date: string | null): date is string => {
   return parsed.getUTCFullYear() === year && parsed.getUTCMonth() === month - 1 && parsed.getUTCDate() === day;
 };
 
+/** Missing items are supported on metadata-only receipts; malformed lines need repair. */
+export function receiptItemsNeedRepair(receipt: ReceiptData): boolean {
+  return receipt.items !== undefined && (
+    !Array.isArray(receipt.items) || receipt.items.some((item) =>
+      !item || typeof item !== "object" || Array.isArray(item) ||
+      typeof item.name !== "string" || !Number.isFinite(item.price) ||
+      (item.translatedName != null && typeof item.translatedName !== "string"),
+    )
+  );
+}
+
+/** Older receipts could retain unusable quantities; line prices are already totals. */
+export function normalizeReceiptQuantities(receipt: ReceiptData): ReceiptData {
+  if (receiptItemsNeedRepair(receipt)) throw new Error("Receipt item details need repair before editing.");
+  const items = receipt.items ?? [];
+  return { ...receipt, items: items.map((item) => ({ ...item,
+    quantity: Number.isFinite(item.quantity) && item.quantity > 0 ? item.quantity : 1,
+  })) };
+}
+
 /** The parts of a scan the app keeps on the expense. */
 export function receiptFromScan(r: ReceiptScan): ReceiptData {
   const textOrNull = (value: string | null | undefined) => {

@@ -41,6 +41,7 @@ export function Button({
   const v = buttons[variant];
   return (
     <Pressable
+      accessibilityRole="button"
       onPress={onPress}
       disabled={disabled || loading}
       style={({ pressed }) => [

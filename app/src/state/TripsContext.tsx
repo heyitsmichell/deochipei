@@ -30,10 +30,8 @@ const receiptQueue = new ReceiptQueue({
     }),
 });
 
-export const resetLocalAccountState = async () => {
-  await receiptQueue.clearForAccount();
-  await repository.resetForAccount();
-};
+export const synchronizeAccount = (id: string | null) => repository.setAccount(id, receiptQueue.clearForAccount);
+export const resetLocalAccountState = () => synchronizeAccount(null);
 
 /**
  * Everything the app can do to trips and queued receipts. The functions never
@@ -43,16 +41,20 @@ const actions = {
   createTrip: repository.createTrip,
   joinTrip: repository.joinTrip,
   claimTripMember: repository.claimTripMember,
+  addSelfToTrip: repository.addSelfToTrip,
+  saveChanges: repository.saved,
   regenerateTripInvite: repository.regenerateTripInvite,
   setMe: repository.setMe,
   addMember: repository.addMember,
   patchTrip: repository.patchTrip,
   saveExpense: repository.saveExpense,
   deleteExpense: repository.deleteExpense,
+  removeDamagedExpense: repository.removeDamagedExpense,
   retryFailed: repository.retryFailed,
   discardFailed: repository.discardFailed,
   removeTripLocally: repository.removeTripLocally,
   refresh: repository.refresh,
+  retryAccountRestore: repository.retryAccountRestore,
   updateSettings: repository.updateSettings,
   setHomeCurrency: repository.setHomeCurrency,
   /** The latest copy right now, for event handlers. While rendering, use `useTrip`. */
@@ -74,10 +76,14 @@ export function TripsProvider({ children }: { children: ReactNode }) {
     receiptQueue.start();
     // Don't wait for the retry timer: push queued changes as soon as a connection is back.
     const offNetwork = network.subscribe(() => {
-      if (network.current().connected) repository.flush();
+      if (network.current().connected) {
+        void repository.restoreAccount();
+        void repository.flush();
+      }
     });
     const appState = AppState.addEventListener("change", (state) => {
       if (state !== "active") return;
+      void repository.restoreAccount();
       repository.flush();
       receiptQueue.process();
     });
@@ -113,6 +119,8 @@ export const useReady = () => useRepository((s) => s.ready);
 /** False when the last request to the sync server didn't get through. */
 export const useOnline = () => useRepository((s) => s.online);
 export const useSyncError = (tripId: string) => useRepository((s) => s.syncErrors[tripId]);
+export const useUnverifiedCount = () => useRepository((s) => Object.keys(s.data.unverified?.trips ?? {}).length);
+export const useRecoveredCount = (tripId: string) => useRepository((s) => s.data.failedOps.filter((op) => op.tripId === tripId && op.recovered).length);
 export const useStorageError = () => useRepository((s) => Boolean(s.storageError));
 
 export const useSettings = () => useRepository((s) => s.data.settings);

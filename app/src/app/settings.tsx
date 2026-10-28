@@ -1,5 +1,6 @@
+import { Alert } from "../lib/alert";
 import { useState } from "react";
-import { Alert, Image, ScrollView, Switch, Text, View } from "react-native";
+import { Image, ScrollView, Switch, Text, View } from "react-native";
 import { Button, Card, Chip, CurrencyPicker, Field, useTheme } from "../components/ui";
 import { useAuth } from "../context/AuthContext";
 import { API_URL } from "../lib/api";

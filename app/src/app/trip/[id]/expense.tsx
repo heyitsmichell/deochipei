@@ -1,8 +1,8 @@
+import { Alert } from "../../../lib/alert";
 import { router, Stack, useLocalSearchParams } from "expo-router";
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
-  Alert,
   Image,
   Pressable,
   ScrollView,
@@ -16,7 +16,7 @@ import { findDuplicate, type DuplicateMatch } from "../../../lib/duplicates";
 import { formatMoney, fromMinor, parseAmount, parseRate, toMinor } from "../../../lib/money";
 import { describeAge, rateService } from "../../../lib/rates";
 import { pickReceiptImage, type ImageSource } from "../../../lib/receiptImage";
-import { isCurrencyCode, isISODate, receiptFromScan } from "../../../lib/receiptScan";
+import { isCurrencyCode, isISODate, normalizeReceiptQuantities, receiptFromScan, receiptItemsNeedRepair } from "../../../lib/receiptScan";
 import { computeItemizedBreakdown, computeShares } from "../../../lib/split";
 import {
   CATEGORIES,
@@ -46,6 +46,8 @@ type Params = { id: string; expenseId?: string; scan?: ImageSource; queuedId?: s
 
 export default function ExpenseScreen() {
   const { styles } = useTheme();
+  const { deleteExpense, removeDamagedExpense, saveChanges } = useTripActions();
+  const [repairing, setRepairing] = useState(false);
   const params = useLocalSearchParams<Params>();
   const trip = useTrip(params.id);
   if (!trip) {
@@ -55,12 +57,46 @@ export default function ExpenseScreen() {
       </View>
     );
   }
+  const existing = trip.expenses.find((expense) => expense.id === params.expenseId);
+  if (existing?.receipt && receiptItemsNeedRepair(existing.receipt)) {
+    return (
+      <View style={[styles.screen, styles.content]}>
+        <Stack.Screen options={{ title: "Receipt needs repair" }} />
+        <Banner>This receipt&apos;s saved item details can&apos;t be edited safely. The original details have been kept.</Banner>
+        {trip.syncEnabled && <Button title="Restore server copy" loading={repairing} onPress={() =>
+          Alert.alert("Restore this expense?", "An intact server copy will replace this expense. Unsent edits to this expense will be discarded. If no intact copy is available, your saved details will be kept.", [
+            { text: "Cancel", style: "cancel" },
+            { text: "Restore", onPress: async () => {
+              setRepairing(true);
+              try {
+                await removeDamagedExpense(trip.id, trip.expenses.indexOf(existing), existing, true);
+                await saveChanges();
+              } catch (error) {
+                Alert.alert("Couldn't restore the receipt", error instanceof Error ? error.message : "Try again while online.");
+              } finally { setRepairing(false); }
+            } },
+          ])
+        } />}
+        <Text style={styles.muted}>To replace the receipt, delete this expense and add it again from the original receipt.</Text>
+        <Button title="Delete expense" variant="danger" onPress={() =>
+          Alert.alert("Delete this expense?", "This removes the expense and its saved receipt details for everyone on the trip. You can add it again from the original receipt.", [
+            { text: "Cancel", style: "cancel" },
+            { text: "Delete", style: "destructive", onPress: () => {
+              deleteExpense(trip.id, existing.id);
+              router.back();
+            } },
+          ])
+        } />
+        <Button title="Back to trip" onPress={() => router.back()} />
+      </View>
+    );
+  }
   return <ExpenseEditor trip={trip} {...params} />;
 }
 
 function ExpenseEditor({ trip, expenseId, scan, queuedId }: Params & { trip: Trip }) {
   const { colors, styles } = useTheme();
-  const { saveExpense, deleteExpense, queueReceipt, discardReceipt, refresh, getTrip } = useTripActions();
+  const { saveExpense, saveChanges, deleteExpense, queueReceipt, discardReceipt, refresh, getTrip } = useTripActions();
   const me = useMe(trip.id);
   const settings = useSettings();
   const receipts = useQueuedReceipts();
@@ -87,16 +123,21 @@ function ExpenseEditor({ trip, expenseId, scan, queuedId }: Params & { trip: Tri
   const [rateInfo, setRateInfo] = useState<string | null>(null);
   const [liveRate, setLiveRate] = useState<number | null>(null);
   const [rateLoading, setRateLoading] = useState(false);
-  const rateEdited = useRef(!!existing);
+  const [rateEdited, setRateEdited] = useState(!!existing);
+  const [rateCurrency, setRateCurrency] = useState(currency);
+  const [rateBase, setRateBase] = useState(trip.baseCurrency);
+  const [saving, setSaving] = useState(false);
+  const savingRef = useRef(false);
   const rateRequest = useRef(0);
+  const invalidateRateRequest = useCallback(() => { ++rateRequest.current; }, []);
   const [paidBy, setPaidBy] = useState(existing?.paidBy ?? queued?.paidBy ?? me ?? allIds[0]);
   const [date, setDate] = useState(existing?.date ?? queued?.capturedOn ?? todayISO());
-  const [splitType, setSplitType] = useState<Split["type"]>(existing?.split.type ?? "equal");
-  const [memberIds, setMemberIds] = useState<string[]>(existing?.split.memberIds ?? queued?.memberIds ?? allIds);
+  const [splitType, setSplitType] = useState<Split["type"]>(existing?.split?.type ?? "equal");
+  const [memberIds, setMemberIds] = useState<string[]>(existing?.split?.memberIds ?? queued?.memberIds ?? allIds);
   const [assignments, setAssignments] = useState<Record<number, string[]>>(
-    existing?.split.type === "items" && existing.split.assignments ? existing.split.assignments : {},
+    existing?.split?.type === "items" && existing.split.assignments ? existing.split.assignments : {},
   );
-  const [receipt, setReceipt] = useState<ReceiptData | undefined>(existing?.receipt);
+  const [receipt, setReceipt] = useState<ReceiptData | undefined>(() => existing?.receipt ? normalizeReceiptQuantities(existing.receipt) : undefined);
   const [taxText, setTaxText] = useState(
     existing?.receipt?.tax != null ? String(existing.receipt.tax) : "",
   );
@@ -113,12 +154,16 @@ function ExpenseEditor({ trip, expenseId, scan, queuedId }: Params & { trip: Tri
   const [checkingDuplicate, setCheckingDuplicate] = useState(false);
 
   const amount = parseAmount(amountText, currency);
-  const rate = parseRate(rateText);
-  const rateWarning = Boolean(rateEdited.current && liveRate && rate && Math.abs(rate / liveRate - 1) > 0.5);
+  const rate = rateCurrency === currency && rateBase === trip.baseCurrency ? parseRate(rateText) : null;
+  const rateWarning = Boolean(rateEdited && liveRate && rate && Math.abs(rate / liveRate - 1) > 0.5);
 
   const loadRate = async (code: string, force = false) => {
     // Only the latest request counts: the currency can change while a rate is loading.
     const request = ++rateRequest.current;
+    setRateText("");
+    setLiveRate(null);
+    setRateCurrency(code);
+    setRateBase(trip.baseCurrency);
     if (code === trip.baseCurrency) {
       setRateText("1");
       setLiveRate(1);
@@ -133,7 +178,7 @@ function ExpenseEditor({ trip, expenseId, scan, queuedId }: Params & { trip: Tri
       setRateText(String(Number(rate.toPrecision(6))));
       setLiveRate(rate);
       setRateInfo(table ? `Live rate · ${table.source} · updated ${describeAge(table.fetchedAt)}` : null);
-      rateEdited.current = false;
+      setRateEdited(false);
     } catch {
       if (request === rateRequest.current) setRateInfo("Couldn't fetch a live rate — enter one manually.");
     } finally {
@@ -142,9 +187,24 @@ function ExpenseEditor({ trip, expenseId, scan, queuedId }: Params & { trip: Tri
   };
 
   useEffect(() => {
-    if (!rateEdited.current) loadRate(currency);
+    let active = true;
+    if (!rateEdited || rateCurrency !== currency || rateBase !== trip.baseCurrency) {
+      void Promise.resolve().then(() => { if (active) return loadRate(currency); });
+    }
+    return () => { active = false; invalidateRateRequest(); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currency]);
+  }, [currency, trip.baseCurrency, invalidateRateRequest]);
+
+  const changeCurrency = (code: string) => {
+    if (code === currency) return;
+    ++rateRequest.current;
+    setRateEdited(false);
+    setRateText("");
+    setLiveRate(null);
+    setRateInfo(null);
+    setRateLoading(code !== trip.baseCurrency);
+    setCurrency(code);
+  };
 
   const runScan = async (source: ImageSource) => {
     let picked;
@@ -201,9 +261,9 @@ function ExpenseEditor({ trip, expenseId, scan, queuedId }: Params & { trip: Tri
     setDescription(r.merchant_translated || r.merchant || description);
     setAmountText(String(r.total));
     if (isCurrencyCode(r.currency)) {
-      rateEdited.current = false;
+      setRateEdited(false);
       if (r.currency === currency) loadRate(r.currency);
-      setCurrency(r.currency);
+      changeCurrency(r.currency);
     }
     if (isISODate(r.date)) setDate(r.date);
     setCategory(r.category);
@@ -235,13 +295,13 @@ function ExpenseEditor({ trip, expenseId, scan, queuedId }: Params & { trip: Tri
           language: prev?.language ?? settings.receiptLanguage ?? "English",
           notes: prev?.notes ?? null,
           items,
-          tax: parseAmount(taxText) ?? null,
-          tip: parseAmount(tipText) ?? null,
-          serviceCharge: parseAmount(feesText) ?? null,
+          tax: parseAmount(taxText, currency) ?? null,
+          tip: parseAmount(tipText, currency) ?? null,
+          serviceCharge: parseAmount(feesText, currency) ?? null,
         };
       });
     },
-    [settings.receiptLanguage, taxText, tipText, feesText],
+    [settings.receiptLanguage, taxText, tipText, feesText, currency],
   );
 
   const handleEditItem = useCallback(
@@ -316,7 +376,7 @@ function ExpenseEditor({ trip, expenseId, scan, queuedId }: Params & { trip: Tri
   }, [scan]);
 
   const validDate = isISODate(date);
-  const valid = amount != null && amount > 0 && rate != null && rate > 0 && validDate;
+  const valid = amount != null && amount > 0 && rate != null && rate > 0 && !rateLoading && validDate;
   const split = useMemo<Split>(
     () =>
       splitType === "items" && (receipt?.items.length ?? 0) > 0
@@ -326,9 +386,9 @@ function ExpenseEditor({ trip, expenseId, scan, queuedId }: Params & { trip: Tri
   );
 
   const effectiveReceipt = useMemo<ReceiptData | undefined>(() => {
-    const tax = parseAmount(taxText);
-    const tip = parseAmount(tipText);
-    const fees = parseAmount(feesText);
+    const tax = parseAmount(taxText, currency);
+    const tip = parseAmount(tipText, currency);
+    const fees = parseAmount(feesText, currency);
     if (!receipt && tax == null && tip == null && fees == null) return undefined;
     return {
       merchant: receipt?.merchant ?? null,
@@ -342,7 +402,7 @@ function ExpenseEditor({ trip, expenseId, scan, queuedId }: Params & { trip: Tri
       tip: tip ?? null,
       serviceCharge: fees ?? null,
     };
-  }, [receipt, taxText, tipText, feesText, settings.receiptLanguage]);
+  }, [receipt, taxText, tipText, feesText, settings.receiptLanguage, currency]);
 
   // Only recomputed when an input to the split changes, not on every keystroke elsewhere.
   const shares = useMemo(
@@ -369,27 +429,42 @@ function ExpenseEditor({ trip, expenseId, scan, queuedId }: Params & { trip: Tri
     [splitType, effectiveReceipt, amount, paidBy, split, currency, rate, trip.baseCurrency],
   );
 
-  const handleCommit = () => {
-    const expense = createExpenseRecord({
-      id: draftId.current,
-      existing,
-      queued,
-      description,
-      category,
-      amount: amount!,
-      currency,
-      rateToBase: rate!,
-      paidBy,
-      date,
-      split,
-      receipt: effectiveReceipt,
-    });
-    saveExpense(trip.id, expense);
-    if (queued) discardReceipt(queued.id);
-    router.back();
+  const handleCommit = async () => {
+    if (savingRef.current) return;
+    savingRef.current = true;
+    setSaving(true);
+    try {
+      const expense = createExpenseRecord({
+        id: draftId.current,
+        existing,
+        queued,
+        description,
+        category,
+        amount: amount!,
+        currency,
+        rateToBase: rate!,
+        paidBy,
+        date,
+        split,
+        receipt: effectiveReceipt,
+      });
+      saveExpense(trip.id, expense);
+      await saveChanges();
+      if (queued) await discardReceipt(queued.id);
+      router.back();
+    } catch (error) {
+      Alert.alert("Couldn't save the expense", error instanceof Error ? error.message : "Try again. Your receipt photo is still kept.");
+    } finally {
+      savingRef.current = false;
+      setSaving(false);
+    }
   };
 
   const handleSave = () => {
+    if (!validDate) {
+      Alert.alert("Invalid date", "Enter a valid date in YYYY-MM-DD format.");
+      return;
+    }
     if (!valid) {
       Alert.alert("Missing amount", "Enter the amount and exchange rate.");
       return;
@@ -506,10 +581,7 @@ function ExpenseEditor({ trip, expenseId, scan, queuedId }: Params & { trip: Tri
         <CurrencyPicker
           compact
           value={currency}
-          onChange={(c) => {
-            rateEdited.current = false;
-            setCurrency(c);
-          }}
+          onChange={changeCurrency}
         />
       </View>
 
@@ -522,7 +594,11 @@ function ExpenseEditor({ trip, expenseId, scan, queuedId }: Params & { trip: Tri
               keyboardType="decimal-pad"
               value={rateText}
               onChangeText={(t) => {
-                rateEdited.current = true;
+                ++rateRequest.current;
+                setRateEdited(true);
+                setRateCurrency(currency);
+                setRateBase(trip.baseCurrency);
+                setRateLoading(false);
                 setRateText(t);
                 setRateInfo("Custom rate");
               }}
@@ -695,8 +771,8 @@ function ExpenseEditor({ trip, expenseId, scan, queuedId }: Params & { trip: Tri
       <Button
         title={existing ? "Save changes" : "Add expense"}
         onPress={handleSave}
-        disabled={scanning}
-        loading={checkingDuplicate}
+        disabled={scanning || saving || rateLoading}
+        loading={checkingDuplicate || saving}
       />
       {existing && <Button title="Delete expense" variant="danger" onPress={handleDelete} style={{ marginTop: 10 }} />}
     </ScrollView>
@@ -733,6 +809,7 @@ function createExpenseRecord(params: {
     date: params.date,
     split: params.split,
     receipt: params.receipt,
+    ...(params.existing?.createdBy ? { createdBy: params.existing.createdBy } : {}),
     createdAt: params.existing?.createdAt ?? params.queued?.capturedAt ?? now,
     updatedAt: now,
   };
