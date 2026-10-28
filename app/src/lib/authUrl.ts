@@ -2,6 +2,7 @@ import type { Session } from "@supabase/supabase-js";
 import { supabase } from "./supabase";
 
 const exchangedCodes = new Set<string>();
+const inFlightCodes = new Map<string, Promise<Session | null>>();
 
 export function extractParamsFromUrl(url: string): Record<string, string> {
   const params: Record<string, string> = {};
@@ -41,14 +42,21 @@ export async function handleAuthUrl(url: string): Promise<Session | null> {
     if (exchangedCodes.has(params.code)) {
       return (await supabase.auth.getSession()).data.session;
     }
-    exchangedCodes.add(params.code);
-    const { data, error } = await supabase.auth.exchangeCodeForSession(params.code);
-    if (error) {
-      exchangedCodes.delete(params.code);
-      throw error;
+    const inFlight = inFlightCodes.get(params.code);
+    if (inFlight) return inFlight;
+    const exchange = (async () => {
+      const { data, error } = await supabase.auth.exchangeCodeForSession(params.code);
+      if (error) throw error;
+      exchangedCodes.add(params.code!);
+      if (exchangedCodes.size > 100) exchangedCodes.delete(exchangedCodes.values().next().value as string);
+      return data.session;
+    })();
+    inFlightCodes.set(params.code, exchange);
+    try {
+      return await exchange;
+    } finally {
+      inFlightCodes.delete(params.code);
     }
-    if (exchangedCodes.size > 100) exchangedCodes.delete(exchangedCodes.values().next().value as string);
-    return data.session;
   }
 
   return null;

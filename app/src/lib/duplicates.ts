@@ -11,7 +11,6 @@ import { todayISO, type Expense, type ReceiptScan, type Trip } from "./types";
 
 /** Body of POST /api/check-duplicate (server/src/duplicates.ts). */
 export interface DuplicateCheckRequest {
-  tripId: string;
   receipt: {
     merchant: string | null;
     merchant_translated: string | null;
@@ -101,7 +100,6 @@ export function duplicateCheckRequest(
 ): DuplicateCheckRequest {
   const name = (id: string) => trip.members.find((m) => m.id === id)?.name ?? "Someone";
   return {
-    tripId: trip.id,
     receipt: {
       merchant: clip(scan.merchant, 200),
       merchant_translated: clip(scan.merchant_translated, 200),

@@ -14,6 +14,8 @@ function supabaseErrorStatus(code?: string) {
   if (code === "42501") return 403;
   if (code === "23505") return 409;
   if (code === "PGRST116") return 404;
+  if (code === "23503" || code === "23514" || code === "22P02" || code === "P0001" || code?.startsWith("22")) return 400;
+  if (code?.startsWith("23")) return 409;
   return 500;
 }
 
@@ -23,10 +25,8 @@ async function withDirectSupabase<T>(operation: () => Promise<T>, fallback: () =
   try {
     return await operation();
   } catch (error) {
-    if (error instanceof ApiError) {
-      throw error;
-    }
-    return fallback();
+    if (error instanceof ApiError) throw error;
+    throw error;
   }
 }
 
@@ -63,7 +63,7 @@ function toTimestamp(value: unknown): number {
     const parsed = Date.parse(value);
     if (Number.isFinite(parsed)) return parsed;
   }
-  return Date.now();
+  throw new ApiError("Invalid server timestamp", 502);
 }
 
 export function joinTripRpcArgs(code: string, claimMemberId: string | null) {
@@ -82,13 +82,18 @@ function toMember(row: Record<string, any>): Member {
 }
 
 function toExpense(row: Record<string, any>): Expense {
+  const amount = Number(row.amount);
+  const rateToBase = Number(row.rate_to_base ?? row.rateToBase);
+  if (!Number.isFinite(amount) || amount <= 0 || !Number.isFinite(rateToBase) || rateToBase <= 0) {
+    throw new ApiError("Invalid expense data", 502);
+  }
   return {
     id: row.id,
     description: row.description ?? row.title ?? "",
     category: (row.category ?? "other") as Expense["category"],
-    amount: Number(row.amount ?? 0),
+    amount,
     currency: row.currency ?? "USD",
-    rateToBase: Number(row.rate_to_base ?? row.rateToBase ?? 1),
+    rateToBase,
     paidBy: row.paid_by ?? row.paidBy ?? row.created_by ?? "",
     createdBy: row.created_by ?? row.createdBy,
     date: row.date ?? new Date().toISOString().slice(0, 10),
@@ -128,7 +133,7 @@ export const supabaseData = {
 
   async createTrip(trip: Trip): Promise<Trip> {
     return withDirectSupabase(async () => {
-      const { data, error } = await supabase
+      const { error } = await supabase
         .from("trips")
         .upsert({
           id: trip.id,
@@ -141,6 +146,7 @@ export const supabaseData = {
         .single();
 
       if (error) throw new ApiError(error.message, supabaseErrorStatus(error.code));
+      const createdBy = (await supabase.auth.getUser()).data.user?.id;
 
       const members = trip.members.map((member) => ({
         id: member.id, trip_id: trip.id, display_name: member.name,
@@ -157,7 +163,7 @@ export const supabaseData = {
         const expenses = trip.expenses.map((expense) => ({
           id: expense.id, trip_id: trip.id, title: expense.description, description: expense.description,
           amount: expense.amount, currency: expense.currency, rate_to_base: expense.rateToBase,
-          paid_by: expense.paidBy, created_by: expense.createdBy,
+          paid_by: expense.paidBy, created_by: createdBy,
           category: expense.category, date: expense.date, receipt_data: expense.receipt ?? null,
           split_definition: expense.split, needs_review: expense.needsReview ?? false,
           created_at: new Date(expense.createdAt).toISOString(), updated_at: new Date(expense.updatedAt).toISOString(),
@@ -165,7 +171,9 @@ export const supabaseData = {
         const result = await supabase.from("expenses").upsert(expenses);
         if (result.error) throw new ApiError(result.error.message, supabaseErrorStatus(result.error.code));
       }
-      return toTrip(data);
+      const created = await supabaseData.getTrip(trip.id);
+      if (!created) throw new ApiError("Trip creation returned no trip", 502);
+      return created;
     }, async () => { throw new ApiError("Trip creation is unavailable", 503); });
   },
 
@@ -179,8 +187,7 @@ export const supabaseData = {
       });
 
       if (error) {
-        const status = error.code === "42501" ? 403 : error.code === "23505" ? 409 : 500;
-        throw new ApiError(error.message, status);
+        throw new ApiError(error.message, supabaseErrorStatus(error.code));
       }
       if (!data) throw new ApiError("Trip not found", 404);
       return normalizeTripResponse(data);
@@ -189,26 +196,8 @@ export const supabaseData = {
     });
   },
 
-  async claimMember(code: string, memberId: string, member?: Member): Promise<Trip> {
+  async claimMember(code: string, memberId: string, _member?: Member): Promise<Trip> {
     return withDirectSupabase(async () => {
-      if (member) {
-        const { data: tripRow, error: tripError } = await supabase
-          .from("trips")
-          .select("id")
-          .eq("invite_code", code)
-          .maybeSingle();
-        if (tripError) throw new ApiError(tripError.message, supabaseErrorStatus(tripError.code));
-        if (!tripRow) throw new ApiError("Trip not found", 404);
-        const { error: memberError } = await supabase.from("trip_members").upsert({
-          id: member.id,
-          trip_id: tripRow.id,
-          display_name: member.name,
-          ...(member.userId !== undefined ? { user_id: member.userId } : {}),
-          ...(member.email !== undefined ? { email: member.email } : {}),
-          ...(member.avatarUrl !== undefined ? { avatar_url: member.avatarUrl } : {}),
-        });
-        if (memberError) throw new ApiError(memberError.message, supabaseErrorStatus(memberError.code));
-      }
       const { data, error } = await supabase.rpc("join_trip_by_code", {
         ...joinTripRpcArgs(code, memberId),
       });
@@ -304,7 +293,7 @@ export const supabaseData = {
           currency: expense.currency,
           rate_to_base: expense.rateToBase,
           paid_by: expense.paidBy,
-          created_by: existing?.createdBy ?? expense.createdBy ?? (await supabase.auth.getUser()).data.user?.id,
+          created_by: existing?.createdBy ?? (await supabase.auth.getUser()).data.user?.id,
           category: expense.category,
           date: expense.date,
           receipt_data: expense.receipt ?? null,

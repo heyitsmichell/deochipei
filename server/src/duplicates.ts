@@ -11,7 +11,6 @@ const Text = z.string().max(200).nullable().default(null);
 
 /** What the app sends: the receipt just scanned, and the expenses that might be the same purchase. */
 export const DuplicateCheckSchema = z.object({
-  tripId: z.string().min(1),
   receipt: z.object({
     merchant: Text,
     merchant_translated: Text,

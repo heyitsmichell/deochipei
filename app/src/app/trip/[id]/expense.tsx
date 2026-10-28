@@ -13,7 +13,7 @@ import {
 import { Banner, Button, Card, Chip, CurrencyPicker, Field, Input, Label, useTheme } from "../../../components/ui";
 import { api, ApiError } from "../../../lib/api";
 import { findDuplicate, type DuplicateMatch } from "../../../lib/duplicates";
-import { formatMoney, fromMinor, parseAmount, toMinor } from "../../../lib/money";
+import { formatMoney, fromMinor, parseAmount, parseRate, toMinor } from "../../../lib/money";
 import { describeAge, rateService } from "../../../lib/rates";
 import { pickReceiptImage, type ImageSource } from "../../../lib/receiptImage";
 import { isCurrencyCode, isISODate, receiptFromScan } from "../../../lib/receiptScan";
@@ -68,6 +68,7 @@ function ExpenseEditor({ trip, expenseId, scan, queuedId }: Params & { trip: Tri
   const existing = expenseId ? trip.expenses.find((e) => e.id === expenseId) : undefined;
   // Captured once: the queue entry is removed when this expense is saved.
   const [queued] = useState(() => (queuedId ? receipts.find((r) => r.id === queuedId) : undefined));
+  const draftId = useRef(existing?.id ?? queued?.id ?? newId());
   const { view } = useHomeCurrency(trip);
   const allIds = trip.members.map((m) => m.id);
   // New expenses default to the currency of the last one: you're usually still in the same country.
@@ -84,6 +85,7 @@ function ExpenseEditor({ trip, expenseId, scan, queuedId }: Params & { trip: Tri
   const [currency, setCurrency] = useState(existing?.currency ?? lastCurrency ?? trip.baseCurrency);
   const [rateText, setRateText] = useState(existing ? String(existing.rateToBase) : "");
   const [rateInfo, setRateInfo] = useState<string | null>(null);
+  const [liveRate, setLiveRate] = useState<number | null>(null);
   const [rateLoading, setRateLoading] = useState(false);
   const rateEdited = useRef(!!existing);
   const rateRequest = useRef(0);
@@ -111,13 +113,15 @@ function ExpenseEditor({ trip, expenseId, scan, queuedId }: Params & { trip: Tri
   const [checkingDuplicate, setCheckingDuplicate] = useState(false);
 
   const amount = parseAmount(amountText, currency);
-  const rate = parseAmount(rateText);
+  const rate = parseRate(rateText);
+  const rateWarning = Boolean(rateEdited.current && liveRate && rate && Math.abs(rate / liveRate - 1) > 0.5);
 
   const loadRate = async (code: string, force = false) => {
     // Only the latest request counts: the currency can change while a rate is loading.
     const request = ++rateRequest.current;
     if (code === trip.baseCurrency) {
       setRateText("1");
+      setLiveRate(1);
       setRateInfo(null);
       setRateLoading(false);
       return;
@@ -127,6 +131,7 @@ function ExpenseEditor({ trip, expenseId, scan, queuedId }: Params & { trip: Tri
       const { rate, table } = await rateService.getRate(code, trip.baseCurrency, force);
       if (request !== rateRequest.current) return;
       setRateText(String(Number(rate.toPrecision(6))));
+      setLiveRate(rate);
       setRateInfo(table ? `Live rate · ${table.source} · updated ${describeAge(table.fetchedAt)}` : null);
       rateEdited.current = false;
     } catch {
@@ -310,7 +315,7 @@ function ExpenseEditor({ trip, expenseId, scan, queuedId }: Params & { trip: Tri
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scan]);
 
-  const validDate = isISODate(date) && !Number.isNaN(Date.parse(`${date}T00:00:00`));
+  const validDate = isISODate(date);
   const valid = amount != null && amount > 0 && rate != null && rate > 0 && validDate;
   const split = useMemo<Split>(
     () =>
@@ -366,6 +371,7 @@ function ExpenseEditor({ trip, expenseId, scan, queuedId }: Params & { trip: Tri
 
   const handleCommit = () => {
     const expense = createExpenseRecord({
+      id: draftId.current,
       existing,
       queued,
       description,
@@ -524,7 +530,11 @@ function ExpenseEditor({ trip, expenseId, scan, queuedId }: Params & { trip: Tri
             <Text style={{ color: colors.text }}>{trip.baseCurrency}</Text>
             <Button title="↻" variant="ghost" loading={rateLoading} onPress={() => loadRate(currency, true)} />
           </View>
-          {rateInfo && <Text style={[styles.muted, { fontSize: 12, marginTop: 6 }]}>{rateInfo}</Text>}
+          {(rateInfo || rateWarning) && (
+            <Text style={[styles.muted, { fontSize: 12, marginTop: 6 }]}>
+              {rateWarning ? "Custom rate differs greatly from the live rate. Check it carefully." : rateInfo}
+            </Text>
+          )}
           {amount != null && rate != null && (
             <Text style={{ marginTop: 8, fontSize: 18, fontWeight: "700", color: colors.tint }}>
               ≈ {formatMoney(amount * rate, trip.baseCurrency)}
@@ -698,6 +708,7 @@ function toggle(list: string[], memberId: string) {
 }
 
 function createExpenseRecord(params: {
+  id: string;
   existing?: Expense;
   queued?: { id: string; capturedAt: number };
   description: string;
@@ -712,7 +723,7 @@ function createExpenseRecord(params: {
 }): Expense {
   const now = Date.now();
   return {
-    id: params.existing?.id ?? params.queued?.id ?? newId(),
+    id: params.id,
     description: params.description.trim(),
     category: params.category,
     amount: params.amount,

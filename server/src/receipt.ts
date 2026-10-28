@@ -14,6 +14,10 @@ const modelNumber = z.preprocess(
   (value) => (value === null || value === "" ? undefined : value),
   z.coerce.number().finite(),
 );
+const detectedLanguage = z.preprocess(
+  (value) => (typeof value !== "string" || value.trim() === "" ? "Unknown" : value.trim()),
+  z.string().min(1).default("Unknown"),
+);
 const currencyCode = z
   .preprocess((value) => (typeof value === "string" ? value.trim().toUpperCase() : value), z.string().regex(/^[A-Z]{3}$/))
   .refine((value) => ISO_CURRENCY_CODES.size === 0 || ISO_CURRENCY_CODES.has(value), "Invalid ISO currency code");
@@ -24,9 +28,7 @@ export const ReceiptSchema = z.object({
     .describe("False if the image is not a receipt, bill, or invoice"),
   merchant: nullableText.describe("Business name as printed"),
   merchant_translated: nullableText.describe("Merchant name in the target language, or null if already in it"),
-  detected_language: z
-    .string()
-    .describe("Main language printed on the receipt, in English, e.g. 'Japanese'"),
+  detected_language: detectedLanguage.describe("Main language printed on the receipt, in English, e.g. 'Japanese'"),
   country: nullableText.describe("Country the receipt is likely from"),
   currency: currencyCode.describe("ISO 4217 code of the amounts on the receipt, e.g. JPY, EUR, THB"),
   date: nullableText.describe("Purchase date as YYYY-MM-DD"),
@@ -36,7 +38,7 @@ export const ReceiptSchema = z.object({
     z.object({
       name: z.string().describe("Line item text exactly as printed"),
       translated_name: nullableText.describe("Line item in the target language"),
-      quantity: modelNumber,
+      quantity: modelNumber.default(1),
       total_price: modelNumber.describe("Line total for this item"),
     }),
   ).max(200),

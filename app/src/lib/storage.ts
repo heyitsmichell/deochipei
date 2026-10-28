@@ -30,23 +30,32 @@ export class MemoryStorage implements KeyValueStorage {
 export class CoalescedWriter {
   private saving?: Promise<void>;
   private unsaved = false;
+  private failed = false;
 
   constructor(
     private readonly storage: KeyValueStorage,
     private readonly key: string,
     private readonly current: () => unknown,
+    private readonly onError?: (error: unknown) => void,
   ) {}
 
   /** Marks the value changed; it's written shortly. */
   save() {
     this.unsaved = true;
+    this.failed = false;
     if (!this.saving) {
-      const run = this.writeUntilSaved();
+      const run = this.writeUntilSaved().catch((error) => {
+        this.unsaved = true;
+        this.failed = true;
+        this.onError?.(error);
+        throw error;
+      });
       let wrapped: Promise<void>;
       wrapped = run.finally(() => {
         if (this.saving === wrapped) this.saving = undefined;
-        if (this.unsaved) this.save();
+        if (this.unsaved && !this.failed) this.save();
       });
+      wrapped.catch(() => {});
       this.saving = wrapped;
     }
   }

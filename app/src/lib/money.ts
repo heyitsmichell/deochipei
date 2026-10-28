@@ -55,11 +55,14 @@ export function fractionDigits(code?: string) {
 
 /** 12.34 USD → 1234; 500 JPY → 500. Settlement maths runs on these integers. */
 export function toMinor(amount: number, code?: string) {
-  return Math.round(amount * 10 ** fractionDigits(code));
+  if (!Number.isFinite(amount)) throw new Error("Invalid money amount");
+  return Math.round((amount + Number.EPSILON) * 10 ** fractionDigits(code));
 }
 
 export function fromMinor(minor: number, code?: string) {
-  return (minor / 10 ** fractionDigits(code)) || 0;
+  const amount = minor / 10 ** fractionDigits(code);
+  if (!Number.isFinite(amount)) throw new Error("Invalid minor-unit amount");
+  return amount;
 }
 
 /**
@@ -68,12 +71,11 @@ export function fromMinor(minor: number, code?: string) {
  * every device computes the same split.
  */
 export function allocate<K>(total: number, weights: ReadonlyMap<K, number>): Map<K, number> {
-  if (total < 0) {
-    const negated = allocate(-total, weights);
-    for (const [k, v] of negated) negated.set(k, -v);
-    return negated;
-  }
+  if (!Number.isSafeInteger(total) || total < 0) throw new Error("Allocation total must be a non-negative integer");
   const result = new Map<K, number>();
+  for (const weight of weights.values()) {
+    if (!Number.isFinite(weight) || weight <= 0) throw new Error("Allocation weights must be positive");
+  }
   const sum = [...weights.values()].reduce((a, b) => a + b, 0);
   if (sum <= 0 || weights.size === 0) return result;
 
@@ -111,8 +113,9 @@ export function formatMoney(amount: number, code: string) {
 
 /** Accepts "1234.5", "1,234.50" and European "1.234,50". */
 export function parseAmount(text: string, code?: string): number | null {
+  if (/[A-Za-z]/.test(text)) return null;
   let s = text.replace(/[^\d.,-]/g, "");
-  if (!s) return null;
+  if (!s || !/\d/.test(s)) return null;
   const lastComma = s.lastIndexOf(",");
   const lastDot = s.lastIndexOf(".");
   if (lastComma > lastDot) {
@@ -127,4 +130,20 @@ export function parseAmount(text: string, code?: string): number | null {
   }
   const n = Number(s);
   return Number.isFinite(n) ? n : null;
+}
+
+/** Parses a user-supplied exchange rate without treating precision as grouping. */
+export function parseRate(text: string): number | null {
+  const raw = text.trim().replace(/\s/g, "");
+  if (!raw || !/^-?\d+(?:[.,]\d+)?(?:[.,]\d+)?$/.test(raw)) return null;
+  const separators = [...raw.matchAll(/[.,]/g)].map((match) => match.index ?? -1);
+  if (!separators.length) {
+    const value = Number(raw);
+    return Number.isFinite(value) ? value : null;
+  }
+  const last = separators[separators.length - 1];
+  const integer = raw.slice(0, last).replace(/[.,]/g, "");
+  const fraction = raw.slice(last + 1);
+  const value = Number(`${integer}.${fraction}`);
+  return Number.isFinite(value) ? value : null;
 }

@@ -59,7 +59,7 @@ export async function requireAuth(
   res: Response,
   next: NextFunction
 ): Promise<void> {
-  if (req.user) {
+  if (process.env.NODE_ENV === "test" && req.user) {
     next();
     return;
   }

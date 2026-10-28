@@ -31,8 +31,8 @@ const receiptQueue = new ReceiptQueue({
 });
 
 export const resetLocalAccountState = async () => {
-  await repository.resetForAccount();
   await receiptQueue.clearForAccount();
+  await repository.resetForAccount();
 };
 
 /**
@@ -49,6 +49,8 @@ const actions = {
   patchTrip: repository.patchTrip,
   saveExpense: repository.saveExpense,
   deleteExpense: repository.deleteExpense,
+  retryFailed: repository.retryFailed,
+  discardFailed: repository.discardFailed,
   removeTripLocally: repository.removeTripLocally,
   refresh: repository.refresh,
   updateSettings: repository.updateSettings,
@@ -110,7 +112,8 @@ export const useReady = () => useRepository((s) => s.ready);
 
 /** False when the last request to the sync server didn't get through. */
 export const useOnline = () => useRepository((s) => s.online);
-export const useSyncError = () => useRepository((s) => s.syncError);
+export const useSyncError = (tripId: string) => useRepository((s) => s.syncErrors[tripId]);
+export const useStorageError = () => useRepository((s) => Boolean(s.storageError));
 
 export const useSettings = () => useRepository((s) => s.data.settings);
 

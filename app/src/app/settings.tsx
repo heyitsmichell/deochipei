@@ -177,7 +177,8 @@ export default function SettingsScreen() {
           placeholder="e.g. Tagalog"
           value={custom}
           onChangeText={setCustom}
-          onEndEditing={() => custom.trim() && updateSettings({ receiptLanguage: custom.trim() })}
+          maxLength={40}
+          onEndEditing={() => custom.trim() && updateSettings({ receiptLanguage: custom.trim().slice(0, 40) })}
         />
       </Card>
       <Card>

@@ -121,6 +121,15 @@ export function categoryIcon(c: Category) {
 }
 
 export function newId() {
+  if (typeof globalThis.crypto?.randomUUID === "function") return globalThis.crypto.randomUUID();
+  try {
+    // Expo Crypto provides a native UUID implementation on device.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { randomUUID } = require("expo-crypto") as typeof import("expo-crypto");
+    if (typeof randomUUID === "function") return randomUUID();
+  } catch {
+    // Fall through for dependency-free tests and older runtimes.
+  }
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
 }
 

@@ -83,6 +83,10 @@ export function resetRateLimits(): void {
 function joinRateLimiter(req: Request, res: Response, next: NextFunction) {
   const key = req.ip || req.socket.remoteAddress || "127.0.0.1";
   const now = Date.now();
+  for (const [storedKey, stored] of joinRateLimitMap) {
+    stored.timestamps = stored.timestamps.filter((timestamp) => now - timestamp < 60_000);
+    if (!stored.timestamps.length) joinRateLimitMap.delete(storedKey);
+  }
   let entry = joinRateLimitMap.get(key);
   if (!entry) {
     entry = { timestamps: [] };
@@ -164,7 +168,7 @@ app.get("/api/trips", requireAuth, (req: Request, res: Response) => {
   const userId = req.user!.id;
   const allTrips: Trip[] = store.list();
   const userTrips = allTrips.filter(
-    (t) => t.ownerId === userId || t.members.some((m) => m.userId === userId || m.id === userId)
+    (t) => t.ownerId === userId || t.members.some((m) => m.userId === userId)
   );
   res.json(userTrips);
 });
@@ -186,14 +190,22 @@ app.post("/api/trips", requireAuth, async (req: Request, res: Response) => {
     return res.status(409).json({ error: "Trip already exists" });
   }
   const tripData = { ...body.data, ownerId: req.user!.id };
-  try { res.json(await store.create(tripData)); } catch { res.status(409).json({ error: "Trip already exists" }); }
+  try {
+    return res.json(await store.create(tripData));
+  } catch (err) {
+    if (err instanceof Error && err.message === "Trip already exists") {
+      return res.status(409).json({ error: "Trip already exists" });
+    }
+    console.error("Trip creation failed", err);
+    return res.status(500).json({ error: "Trip could not be created." });
+  }
 });
 
 app.get("/api/trips/:id", requireAuth, (req: Request, res: Response) => {
   const id = extractParam(req.params.id);
   const trip = store.get(id);
   if (!trip) return notFound(res);
-  const isMember = trip.ownerId === req.user!.id || trip.members.some(m => m.userId === req.user!.id || m.id === req.user!.id);
+  const isMember = trip.ownerId === req.user!.id || trip.members.some(m => m.userId === req.user!.id);
   if (!isMember) {
     return res.status(403).json({ error: "Not a member of this trip" });
   }
@@ -296,11 +308,11 @@ app.put("/api/trips/:id/members/:memberId", requireAuth, async (req: Request, re
   if (!trip) return notFound(res);
 
   const member = trip.members.find(m => m.id === memberId);
-  const isMember = trip.ownerId === req.user!.id || trip.members.some(m => m.userId === req.user!.id || m.id === req.user!.id);
+  const isMember = trip.ownerId === req.user!.id || trip.members.some(m => m.userId === req.user!.id);
   if (!isMember) {
     return res.status(403).json({ error: "Not a member of this trip" });
   }
-  const mayEdit = trip.ownerId === req.user!.id || member?.userId === req.user!.id || member?.id === req.user!.id;
+  const mayEdit = trip.ownerId === req.user!.id || member?.userId === req.user!.id;
   if (!mayEdit) {
     return res.status(403).json({ error: "Only the trip owner can manage members" });
   }
@@ -337,7 +349,7 @@ app.put("/api/trips/:id/expenses/:expenseId", requireAuth, async (req: Request, 
   if (!trip) return notFound(res);
 
   // Check if user is a member of this trip or owner
-  const isMember = trip.ownerId === req.user!.id || trip.members.some(m => m.userId === req.user!.id || m.id === req.user!.id);
+  const isMember = trip.ownerId === req.user!.id || trip.members.some(m => m.userId === req.user!.id);
   if (!isMember) {
     return res.status(403).json({ error: "Not a member of this trip" });
   }
@@ -359,7 +371,7 @@ app.delete("/api/trips/:id/expenses/:expenseId", requireAuth, async (req: Reques
   if (!trip) return notFound(res);
 
   // Check if user is a member of this trip or owner
-  const isMember = trip.ownerId === req.user!.id || trip.members.some(m => m.userId === req.user!.id || m.id === req.user!.id);
+  const isMember = trip.ownerId === req.user!.id || trip.members.some(m => m.userId === req.user!.id);
   if (!isMember) {
     return res.status(403).json({ error: "Not a member of this trip" });
   }
@@ -416,26 +428,11 @@ async function handleScanReceipt(req: Request, res: Response) {
   }
 }
 
-const DuplicateCheckExtendedSchema = DuplicateCheckSchema;
-
 async function handleCheckDuplicate(req: Request, res: Response) {
-  const body = DuplicateCheckExtendedSchema.safeParse(req.body);
+  const body = DuplicateCheckSchema.safeParse(req.body);
   if (!body.success) {
     console.warn("Invalid duplicate-check request", body.error.issues);
     return res.status(400).json({ error: "Invalid duplicate-check request." });
-  }
-
-  const matchingTrip = store.get(body.data.tripId);
-  if (!matchingTrip) return notFound(res);
-
-  if (matchingTrip) {
-    const userId = req.user!.id;
-    const isMember =
-      matchingTrip.ownerId === userId ||
-      matchingTrip.members.some((m) => m.userId === userId || m.id === userId);
-    if (!isMember) {
-      return res.status(403).json({ error: "You are not a member of this trip." });
-    }
   }
 
   try {

@@ -38,7 +38,7 @@ export interface QueuedReceipt {
 }
 
 export interface ReceiptQueueDeps {
-  repo: Pick<TripRepository, "ready" | "getTrip" | "meFor" | "saveExpense" | "getSnapshot" | "refresh">;
+  repo: Pick<TripRepository, "ready" | "getTrip" | "meFor" | "saveExpense" | "saved" | "getSnapshot" | "refresh">;
   network: NetworkMonitor;
   storage: KeyValueStorage;
   files: ReceiptFileStore;
@@ -81,7 +81,10 @@ export class ReceiptQueue {
     private readonly storageKey = "deochipei:receipts:v1",
     private readonly retryMs = 30000,
   ) {
-    this.writer = new CoalescedWriter(deps.storage, storageKey, () => this.items);
+    this.writer = new CoalescedWriter(deps.storage, storageKey, () => this.items, () => {
+      this.persistenceUnavailable = false;
+      this.emit();
+    });
   }
 
   // ── Subscription ────────────────────────────────────────────────────────
@@ -241,7 +244,18 @@ export class ReceiptQueue {
     for (;;) {
       const item = this.items.find((i) => i.status === "waiting" && !skipped.has(i.id) && this.mayRead(i));
       if (!item) return;
-      const outcome = await this.read(item);
+      let outcome: Outcome;
+      try {
+        outcome = await this.read(item);
+      } catch (error) {
+        if (this.has(item.id)) {
+          this.patch(item.id, {
+            status: "waiting",
+            error: error instanceof Error ? error.message : "Could not finish reading this receipt.",
+          });
+        }
+        return;
+      }
       if (outcome === "stop") return;
       if (outcome === "skip") skipped.add(item.id);
     }
@@ -329,6 +343,12 @@ export class ReceiptQueue {
     }
 
     this.deps.repo.saveExpense(trip.id, expenseFromScan(item, scan, trip, rateToBase));
+    try {
+      await this.deps.repo.saved();
+    } catch {
+      this.patch(item.id, { status: "waiting", error: "Could not save this expense locally. It will retry." });
+      return "stop";
+    }
     this.discard(item.id);
     return "next";
   }

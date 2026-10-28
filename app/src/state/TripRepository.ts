@@ -8,12 +8,13 @@ export type TripApi = typeof defaultApi;
 export type TripPatch = Partial<Pick<Trip, "name" | "baseCurrency">>;
 
 /** A change made on this device that the server hasn't confirmed yet. */
+type OpMeta = { attempts?: number; retryAt?: number };
 export type Op =
-  | { kind: "createTrip"; tripId: string }
-  | { kind: "patchTrip"; tripId: string; patch: TripPatch }
-  | { kind: "upsertMember"; tripId: string; member: Member }
-  | { kind: "upsertExpense"; tripId: string; expense: Expense }
-  | { kind: "deleteExpense"; tripId: string; expenseId: string };
+  | ({ kind: "createTrip"; tripId: string } & OpMeta)
+  | ({ kind: "patchTrip"; tripId: string; patch: TripPatch } & OpMeta)
+  | ({ kind: "upsertMember"; tripId: string; member: Member } & OpMeta)
+  | ({ kind: "upsertExpense"; tripId: string; expense: Expense } & OpMeta)
+  | ({ kind: "deleteExpense"; tripId: string; expenseId: string } & OpMeta);
 
 export interface Settings {
   receiptLanguage: string;
@@ -37,7 +38,8 @@ export interface PersistedData {
 export interface RepositorySnapshot {
   ready: boolean;
   online: boolean;
-  syncError?: string;
+  syncErrors: Record<string, string>;
+  storageError?: boolean;
   data: PersistedData;
 }
 
@@ -84,7 +86,7 @@ function upsertById<T extends { id: string }>(list: T[], item: T): T[] {
  * `getSnapshot` (useSyncExternalStore).
  */
 export class TripRepository {
-  private snapshot: RepositorySnapshot = { ready: false, online: true, data: EMPTY };
+  private snapshot: RepositorySnapshot = { ready: false, online: true, syncErrors: {}, data: EMPTY };
   private readonly listeners = new Set<() => void>();
   private loading?: Promise<void>;
   private starting?: Promise<void>;
@@ -101,7 +103,13 @@ export class TripRepository {
     private readonly storageKey = "deochipei:v1",
     private readonly retryMs = 15000,
   ) {
-    this.writer = new CoalescedWriter(storage, storageKey, () => this.data);
+    this.writer = new CoalescedWriter(storage, storageKey, () => this.data, () => {
+      // A write failure can be retried on the next change; a read failure is
+      // kept disabled so a later save cannot overwrite unknown stored data.
+      this.persistenceUnavailable = false;
+      this.snapshot = { ...this.snapshot, storageError: true };
+      this.emit();
+    });
   }
 
   // ── Subscription ────────────────────────────────────────────────────────
@@ -119,7 +127,13 @@ export class TripRepository {
   ready = () => (this.loading ??= this.load());
 
   /** Resolves once every change so far has been written to storage. */
-  saved = () => this.writer.saved();
+  saved = async () => {
+    if (this.persistenceUnavailable || this.snapshot.storageError) {
+      throw new Error("Local storage is unavailable.");
+    }
+    await this.writer.saved();
+    if (this.snapshot.storageError) throw new Error("Local storage is unavailable.");
+  };
 
   /** Idempotent: safe under React StrictMode's double effects. */
   start() {
@@ -148,6 +162,23 @@ export class TripRepository {
   pendingCount = (tripId: string) => this.data.ops.filter((o) => o.tripId === tripId).length;
   failedCount = (tripId: string) => this.data.failedOps.filter((o) => o.tripId === tripId).length;
 
+  retryFailed = (tripId: string) => {
+    const failed = this.data.failedOps.filter((op) => op.tripId === tripId);
+    if (!failed.length) return;
+    this.update((d) => ({
+      ...d,
+      failedOps: d.failedOps.filter((op) => op.tripId !== tripId),
+      ops: [...d.ops, ...failed.map(({ attempts: _attempts, retryAt: _retryAt, ...op }) => op as Op)],
+    }));
+    this.flush();
+  };
+
+  discardFailed = async (tripId: string) => {
+    if (!this.data.failedOps.some((op) => op.tripId === tripId)) return;
+    this.update((d) => ({ ...d, failedOps: d.failedOps.filter((op) => op.tripId !== tripId) }));
+    await this.refresh(tripId);
+  };
+
   // ── Commands ────────────────────────────────────────────────────────────
 
   createTrip = (input: {
@@ -158,8 +189,11 @@ export class TripRepository {
     ownerEmail?: string;
     ownerAvatarUrl?: string;
   }): Trip => {
-    const members: Member[] = input.memberNames.map((name, index) => {
-      const member: Member = { id: newId(), name: name.trim().slice(0, 60) };
+    const name = input.name.trim();
+    const memberNames = input.memberNames.map((memberName) => memberName.trim()).filter(Boolean);
+    if (!name || !memberNames.length) throw new ApiError("A trip needs a name and at least one member.", 400);
+    const members: Member[] = memberNames.map((memberName, index) => {
+      const member: Member = { id: newId(), name: memberName.slice(0, 60) };
       if (index === 0 && input.ownerId) {
         member.userId = input.ownerId;
         if (input.ownerEmail) member.email = input.ownerEmail;
@@ -171,7 +205,7 @@ export class TripRepository {
     if (homeCurrency) members[0] = { ...members[0], homeCurrency };
     const trip: Trip = {
       id: newId(),
-      name: input.name.trim().slice(0, 80),
+      name: name.slice(0, 80),
       baseCurrency: input.baseCurrency,
       members,
       expenses: [],
@@ -215,7 +249,7 @@ export class TripRepository {
     let resolvedTrip = trip;
     if (user?.id) {
       const existing = trip.members.find(
-        (m) => m.userId === user.id || m.id === user.id,
+        (m) => m.userId === user.id,
       );
       if (existing) {
         const updatedMember = {
@@ -287,6 +321,7 @@ export class TripRepository {
     user?: { id?: string; email?: string; avatarUrl?: string },
     queue = true,
   ): Member => {
+    if (!name.trim()) throw new ApiError("Member name cannot be empty.", 400);
     const member: Member = {
       id: newId(), name: name.trim().slice(0, 60), userId: user?.id, email: user?.email, avatarUrl: user?.avatarUrl,
     };
@@ -299,6 +334,7 @@ export class TripRepository {
   };
 
   patchTrip = (tripId: string, patch: TripPatch) => {
+    if (patch.name !== undefined && !patch.name.trim()) throw new ApiError("Trip name cannot be empty.", 400);
     const normalized = {
       ...(patch.name !== undefined ? { name: patch.name.trim().slice(0, 80) } : {}),
       ...(patch.baseCurrency !== undefined ? { baseCurrency: patch.baseCurrency } : {}),
@@ -340,6 +376,7 @@ export class TripRepository {
 
   /** Push queued changes, then pull the latest copy of the trip if it has changed. */
   refresh = (tripId: string): Promise<void> => {
+    if (!this.data.trips[tripId]?.syncEnabled) return Promise.resolve();
     const ongoing = this.refreshing.get(tripId);
     if (ongoing) return ongoing;
     const run = (async () => {
@@ -349,7 +386,7 @@ export class TripRepository {
         const server = await this.api.getTrip(tripId, local?.revision);
         if (server) this.adopt(server);
         this.setOnline(true);
-        this.setSyncError(undefined);
+        this.setSyncError(tripId, undefined);
       } catch (err) {
         if (err instanceof ApiError && !err.isRetryable) {
           this.setOnline(true);
@@ -357,10 +394,10 @@ export class TripRepository {
             ? "This trip is no longer available to this account."
             : "The trip could not be refreshed.";
           console.warn("Trip refresh rejected", tripId, err.status, err.message);
-          this.setSyncError(message);
+          this.setSyncError(tripId, message);
         } else {
           this.setOnline(false);
-          this.setSyncError("Trip sync is unavailable. Changes will retry when you reconnect.");
+          this.setSyncError(tripId, "Trip sync is unavailable. Changes will retry when you reconnect.");
         }
       }
     })();
@@ -422,7 +459,7 @@ export class TripRepository {
       if (!raw) raw = await this.storage.getItem(backupKeyBase);
     } catch {
       this.persistenceUnavailable = true;
-      this.snapshot = { ...this.snapshot, ready: true };
+      this.snapshot = { ...this.snapshot, ready: true, storageError: true };
       this.emit();
       return;
     }
@@ -452,6 +489,7 @@ export class TripRepository {
   private async drainQueue() {
     while (this.data.ops.length) {
       const op = this.data.ops[0];
+      if ((op.retryAt ?? 0) > Date.now()) return;
       try {
         const server = await this.send(op);
         this.dropOp(op);
@@ -464,6 +502,12 @@ export class TripRepository {
           continue;
         }
         if (err instanceof ApiError && err.isRetryable) {
+          const attempts = (op.attempts ?? 0) + 1;
+          const retryAt = Date.now() + Math.min(15 * 60_000, 1000 * 2 ** Math.min(attempts, 9));
+          this.update((d) => ({
+            ...d,
+            ops: d.ops.map((candidate) => (candidate === op ? { ...candidate, attempts, retryAt } : candidate)),
+          }));
           this.setOnline(false);
           return;
         }
@@ -523,7 +567,10 @@ export class TripRepository {
       const local = d.trips[server.id];
       // Ignore late responses for trips removed from this device.
       if (!local && !allowNew) return d;
-      const pending = d.ops.filter((o) => o.tripId === server.id);
+      const pending = [
+        ...d.ops.filter((o) => o.tripId === server.id),
+        ...d.failedOps.filter((o) => o.tripId === server.id),
+      ];
       // Compare server-owned revisions when available; device timestamps are
       // not comparable across clocks. Keep the timestamp fallback for older
       // server copies that predate revisions.
@@ -564,9 +611,12 @@ export class TripRepository {
     this.emit();
   }
 
-  private setSyncError(syncError: string | undefined) {
-    if (syncError === this.snapshot.syncError) return;
-    this.snapshot = { ...this.snapshot, syncError };
+  private setSyncError(tripId: string, message: string | undefined) {
+    const syncErrors = { ...this.snapshot.syncErrors };
+    if (message) syncErrors[tripId] = message;
+    else delete syncErrors[tripId];
+    if (syncErrors[tripId] === this.snapshot.syncErrors[tripId] && Object.keys(syncErrors).length === Object.keys(this.snapshot.syncErrors).length) return;
+    this.snapshot = { ...this.snapshot, syncErrors };
     this.emit();
   }
 
@@ -591,6 +641,7 @@ export class TripRepository {
       ready: true,
     };
     this.persistenceUnavailable = false;
+    this.snapshot = { ...this.snapshot, storageError: false };
     this.writer.save();
     await this.writer.saved();
     await this.storage.removeItem?.(`${this.storageKey}:backup`).catch(() => {});

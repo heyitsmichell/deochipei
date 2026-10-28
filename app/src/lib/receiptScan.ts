@@ -2,7 +2,12 @@ import type { ReceiptData, ReceiptScan } from "./types";
 
 export const isCurrencyCode = (code: string) => /^[A-Z]{3}$/.test(code);
 
-export const isISODate = (date: string | null): date is string => !!date && /^\d{4}-\d{2}-\d{2}$/.test(date);
+export const isISODate = (date: string | null): date is string => {
+  if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) return false;
+  const [year, month, day] = date.split("-").map(Number);
+  const parsed = new Date(Date.UTC(year, month - 1, day));
+  return parsed.getUTCFullYear() === year && parsed.getUTCMonth() === month - 1 && parsed.getUTCDate() === day;
+};
 
 /** The parts of a scan the app keeps on the expense. */
 export function receiptFromScan(r: ReceiptScan): ReceiptData {

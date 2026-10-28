@@ -95,6 +95,9 @@ export class Ledger {
   }
 
   private record(e: Expense) {
+    if (!Number.isFinite(e.amount) || e.amount <= 0 || !Number.isFinite(e.rateToBase) || e.rateToBase <= 0) {
+      throw new Error(`Invalid expense ${e.id}`);
+    }
     const total = toMinor(baseAmount(e), this.currency);
     const weights = new Map(Object.entries(computeShares(e)));
     // Split the rounded total itself, so the shares always add up to what was paid.

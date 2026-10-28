@@ -15,6 +15,7 @@ import {
   useMe,
   useNetwork,
   useOnline,
+  useStorageError,
   useSyncError,
   usePendingCount,
   useFailedCount,
@@ -40,11 +41,11 @@ export default function TripScreen() {
   // use battery; it picks up straight away when either comes back.
   useFocusEffect(
     useCallback(() => {
-      if (!connected || !foreground) return;
+      if (!connected || !foreground || !trip?.syncEnabled) return;
       refresh(id);
       const t = setInterval(() => refresh(id), 5000);
       return () => clearInterval(t);
-    }, [id, refresh, connected, foreground]),
+    }, [id, refresh, connected, foreground, trip?.syncEnabled]),
   );
 
   if (!trip) {
@@ -59,13 +60,14 @@ export default function TripScreen() {
 
 function TripView({ trip }: { trip: Trip }) {
   const { colors, styles } = useTheme();
-  const { addMember, removeTripLocally, setMe, setHomeCurrency, queueReceipt } = useTripActions();
+  const { addMember, removeTripLocally, setMe, setHomeCurrency, queueReceipt, retryFailed, discardFailed } = useTripActions();
   const { user, displayName: authName, avatarUrl: authAvatar } = useAuth();
   const me = useMe(trip.id);
   const pending = usePendingCount(trip.id);
   const failed = useFailedCount(trip.id);
   const online = useOnline();
-  const syncError = useSyncError();
+  const syncError = useSyncError(trip.id);
+  const storageError = useStorageError();
   const network = useNetwork();
   const [tab, setTab] = useState<Tab>("expenses");
   const [adding, setAdding] = useState(false);
@@ -138,9 +140,11 @@ function TripView({ trip }: { trip: Trip }) {
 
   const header = (
     <>
-      {(pending > 0 || failed > 0 || !online || !!syncError) && (
+      {(pending > 0 || failed > 0 || !online || !!syncError || storageError) && (
         <Banner>
-          {syncError
+          {storageError
+            ? "Local storage is unavailable; changes will not survive until it recovers."
+            : syncError
             ? syncError
             : failed
               ? `${failed} change${failed === 1 ? "" : "s"} was rejected by the server. Review it while online.`
@@ -149,6 +153,12 @@ function TripView({ trip }: { trip: Trip }) {
                 : `Offline${pending ? ` — ${pending} change${pending === 1 ? "" : "s"} waiting to sync` : ""}. ` +
                   "Receipts you snap are saved and read once you're back on Wi-Fi."}
         </Banner>
+      )}
+      {failed > 0 && (
+        <View style={{ flexDirection: "row", gap: 8, marginBottom: 10 }}>
+          <Button title="Retry rejected changes" variant="secondary" onPress={() => retryFailed(trip.id)} style={{ flex: 1 }} />
+          <Button title="Discard" variant="ghost" onPress={() => void discardFailed(trip.id)} style={{ flex: 0.5 }} />
+        </View>
       )}
 
       <Card>

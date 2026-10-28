@@ -2,6 +2,7 @@ import type { Session, User } from "@supabase/supabase-js";
 import { makeRedirectUri } from "expo-auth-session";
 import * as Linking from "expo-linking";
 import * as WebBrowser from "expo-web-browser";
+import { AppState } from "react-native";
 import React, { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
 import { extractParamsFromUrl, handleAuthUrl, isAuthCallbackUrl } from "../lib/authUrl";
 import { supabase } from "../lib/supabase";
@@ -33,6 +34,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     let isMounted = true;
+    supabase.auth.startAutoRefresh();
+    const appState = AppState.addEventListener("change", (state) => {
+      if (state === "active") supabase.auth.startAutoRefresh();
+      else supabase.auth.stopAutoRefresh();
+    });
 
     // Load initial session from storage
     supabase.auth
@@ -86,6 +92,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
     return () => {
       isMounted = false;
+      appState.remove();
+      supabase.auth.stopAutoRefresh();
       subscription.unsubscribe();
       sub.remove();
     };

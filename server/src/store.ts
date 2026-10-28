@@ -44,7 +44,7 @@ export type NewTrip = Pick<Trip, "id" | "name" | "baseCurrency" | "members" | "e
 /** Authorization rule shared by the HTTP layer and tests. */
 export function canEditExpense(trip: Trip, userId: string, expense: Expense | undefined): boolean {
   if (trip.ownerId === userId) return true;
-  if (!trip.members.some((m) => m.userId === userId || m.id === userId)) return false;
+  if (!trip.members.some((m) => m.userId === userId)) return false;
   // A legacy expense has no trustworthy persisted creator. Only the owner may
   // repair it; an arbitrary member must not be able to overwrite it.
   if (!expense) return true;
@@ -120,7 +120,13 @@ export class TripStore {
       revision: ++this.revision,
     };
     this.index(trip);
-    await this.save();
+    try {
+      await this.save();
+    } catch (error) {
+      this.trips.delete(trip.id);
+      this.byCode.delete(trip.code);
+      throw error;
+    }
     return trip;
   }
 
@@ -153,7 +159,6 @@ export class TripStore {
       const existing = trip.members.find(
         (m) =>
           m.userId === memberData.userId ||
-          m.id === memberData.userId ||
           (memberData.email && m.email === memberData.email)
       );
       if (existing) {
@@ -265,9 +270,13 @@ export class TripStore {
     this.dirty = true;
     if (!this.saving) {
       const run = this.writeUntilClean();
-      const wrapped = run.finally(() => {
+      let succeeded = false;
+      const wrapped = run.then(
+        () => { succeeded = true; },
+        (error) => { throw error; },
+      ).finally(() => {
         if (this.saving === wrapped) this.saving = undefined;
-        if (this.dirty) this.save();
+        if (succeeded && this.dirty) void this.save().catch((error) => console.error("Trip store retry failed", error));
       });
       this.saving = wrapped;
     }
