@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { MemoryStorage } from "../../lib/storage";
 import { ApiError } from "../../lib/errors";
 import { expense, trip } from "../../lib/__tests__/fixtures";
-import type { Expense, Trip, TripPreview } from "../../lib/types";
+import type { Expense, ReceiptData, Trip, TripPreview } from "../../lib/types";
 import { inspectLedger } from "../../lib/ledger";
 import { TripRepository, type TripApi } from "../TripRepository";
 import { ReceiptQueue } from "../ReceiptQueue";
@@ -389,6 +389,89 @@ test("shared repair deletes only a server-confirmed damaged expense", async () =
   assert.deepEqual(repo.getTrip("trip")!.expenses, []);
 });
 
+test("receipt restoration adopts intact server data without deleting the shared expense", async () => {
+  const original = expense({ receipt: { items: { meal: { name: "Meal", price: 10 } } } as unknown as ReceiptData });
+  const restored = expense({ receipt: { merchant: "Original shop", merchantTranslated: null, language: "English", notes: null,
+    items: [{ name: "Meal", translatedName: null, quantity: 1, price: 10 }] } });
+  const { repo, storage } = await repository({ getTrip: async () => trip({ expenses: [restored] }),
+    deleteExpense: async () => assert.fail("Restoration must never delete") }, trip({ expenses: [original] }));
+  await repo.removeDamagedExpense("trip", 0, repo.getTrip("trip")!.expenses[0], true);
+  await repo.saved();
+  assert.deepEqual(repo.getTrip("trip")!.expenses, [restored]);
+  assert.deepEqual(JSON.parse((await storage.getItem("repo"))!).trips.trip.expenses, [restored]);
+  assert.equal(repo.pendingCount("trip"), 0);
+});
+
+test("receipt restoration preserves local data when the server receipt is missing or malformed", async () => {
+  for (const items of [undefined, "no receipt", { meal: { name: "Meal", price: 10 } }, [null], [{ name: "Meal", price: 10, translatedName: {} }]]) {
+    const original = expense({ receipt: { items: { original: "Retain me" } } as unknown as ReceiptData });
+    const remote = items === undefined ? [] : [expense({ receipt: items === "no receipt" ? undefined : { items } as unknown as ReceiptData })];
+    const { repo } = await repository({ getTrip: async () => trip({ expenses: remote }),
+      deleteExpense: async () => assert.fail("Restoration must never delete") }, trip({ expenses: [original] }));
+    const before = repo.getTrip("trip")!.expenses[0];
+    await assert.rejects(repo.removeDamagedExpense("trip", 0, before, true), /No intact server receipt/);
+    assert.equal(repo.getTrip("trip")!.expenses[0], before);
+    assert.equal(repo.pendingCount("trip"), 0);
+  }
+});
+
+test("receipt restoration holds damaged pending upserts until the server copy is validated", async (t) => {
+  let resolveFetch!: (value: Trip) => void;
+  let upserts = 0;
+  const original = expense({ receipt: { items: { original: "Retain me" } } as unknown as ReceiptData });
+  const restored = expense({ receipt: { merchant: null, merchantTranslated: null, language: "English", notes: null,
+    items: [{ name: "Meal", translatedName: null, quantity: 1, price: 10 }] } });
+  const { repo } = await repository({
+    getTrip: () => new Promise((resolve) => { resolveFetch = resolve; }),
+    upsertExpense: async () => { upserts++; throw new ApiError("Temporarily unavailable", 503); },
+    deleteExpense: async () => assert.fail("Restoration must never delete"),
+  });
+  repo.saveExpense("trip", original);
+  await repo.flush();
+  assert.equal(repo.pendingCount("trip"), 1);
+  const retryAt = repo.getSnapshot().data.ops[0].retryAt!;
+  t.mock.method(Date, "now", () => retryAt + 1);
+  const restoring = repo.removeDamagedExpense("trip", 0, repo.getTrip("trip")!.expenses[0], true);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(repo.pendingCount("trip"), 1);
+  await repo.flush();
+  assert.equal(upserts, 1);
+  resolveFetch(trip({ expenses: [restored] }));
+  await restoring;
+  assert.deepEqual(repo.getTrip("trip")!.expenses, [restored]);
+  assert.equal(repo.pendingCount("trip"), 0);
+});
+
+test("failed receipt restoration retains unsent edits and releases their temporary hold", async (t) => {
+  const original = expense({ receipt: { items: { original: "Retain me" } } as unknown as ReceiptData });
+  let upserts = 0;
+  const { repo } = await repository({ getTrip: async () => trip(),
+    upsertExpense: async () => { upserts++; throw new ApiError("Temporarily unavailable", 503); } });
+  repo.saveExpense("trip", original);
+  await repo.flush();
+  const before = repo.getTrip("trip")!.expenses[0];
+  const retryAt = repo.getSnapshot().data.ops[0].retryAt!;
+  t.mock.method(Date, "now", () => retryAt + 1);
+  await assert.rejects(repo.removeDamagedExpense("trip", 0, before, true), /No intact server receipt/);
+  assert.equal(repo.getTrip("trip")!.expenses[0], before);
+  assert.equal(repo.pendingCount("trip"), 1);
+  assert.equal(upserts, 1);
+  await repo.flush();
+  assert.equal(upserts, 2);
+});
+
+test("receipt restoration cannot discard a guest receipt or an offline shared receipt", async () => {
+  for (const syncEnabled of [false, true]) {
+    const original = expense({ receipt: { items: null } as unknown as ReceiptData });
+    const { repo } = await repository({ getTrip: async () => { throw new Error("offline"); },
+      deleteExpense: async () => assert.fail("Restoration must never delete") }, trip({ syncEnabled, expenses: [original] }));
+    const before = repo.getTrip("trip")!.expenses[0];
+    await assert.rejects(repo.removeDamagedExpense("trip", 0, before, true), syncEnabled ? /offline/ : /no shared server copy/);
+    assert.equal(repo.getTrip("trip")!.expenses[0], before);
+    assert.equal(repo.pendingCount("trip"), 0);
+  }
+});
+
 test("offline shared repair preserves the damaged entry and never queues deletion", async () => {
   const { repo } = await repository({ getTrip: async () => { throw new Error("offline"); },
     deleteExpense: async () => assert.fail("Must not delete offline") }, trip({ expenses: [expense({ rateToBase: 0 })] }));
@@ -399,15 +482,17 @@ test("offline shared repair preserves the damaged entry and never queues deletio
 });
 
 test("a delayed shared repair cannot change a different account's trip", async () => {
-  let resolve!: (trip: Trip) => void;
-  const { repo } = await repository({ getTrip: () => new Promise((done) => { resolve = done; }) }, trip({ expenses: [expense({ rateToBase: 0 })] }));
-  const repairing = repo.removeDamagedExpense("trip", 0, repo.getTrip("trip")!.expenses[0]);
-  await new Promise((done) => setImmediate(done));
-  await repo.setAccount(null);
-  resolve(trip());
-  await repairing;
-  assert.equal(repo.getTrip("trip"), undefined);
-  assert.equal(repo.pendingCount("trip"), 0);
+  for (const restoreOnly of [false, true]) {
+    let resolve!: (trip: Trip) => void;
+    const { repo } = await repository({ getTrip: () => new Promise((done) => { resolve = done; }) }, trip({ expenses: [expense({ rateToBase: 0 })] }));
+    const repairing = repo.removeDamagedExpense("trip", 0, repo.getTrip("trip")!.expenses[0], restoreOnly);
+    await new Promise((done) => setImmediate(done));
+    await repo.setAccount(null);
+    resolve(trip());
+    await repairing;
+    assert.equal(repo.getTrip("trip"), undefined);
+    assert.equal(repo.pendingCount("trip"), 0);
+  }
 });
 
 for (const failure of ["reset callback", "reset write", "migrate callback"]) {

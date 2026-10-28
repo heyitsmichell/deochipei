@@ -2,6 +2,7 @@ import type { api as defaultApi } from "../lib/api";
 import { ApiError } from "../lib/errors";
 import { isInviteExpired } from "../lib/invite";
 import { inspectLedger } from "../lib/ledger";
+import { receiptItemsNeedRepair } from "../lib/receiptScan";
 import { CoalescedWriter, type KeyValueStorage } from "../lib/storage";
 import { isTripPreview, newId, type TripLookup, type Expense, type Member, type ThemePreference, type Trip } from "../lib/types";
 
@@ -97,6 +98,7 @@ export class TripRepository {
   private loading?: Promise<void>;
   private starting?: Promise<void>;
   private flushing?: Promise<void>;
+  private readonly receiptRestorations = new Set<string>();
   private flushAgain = false;
   private readonly refreshing = new Map<string, Promise<void>>();
   private persistenceUnavailable = false;
@@ -511,36 +513,55 @@ export class TripRepository {
   };
 
   /** Confirmed repair restores intact server data before considering shared deletion. */
-  removeDamagedExpense = async (tripId: string, index: number, expected: unknown) => {
+  removeDamagedExpense = async (tripId: string, index: number, expected: unknown, restoreOnly = false) => {
     const trip = this.data.trips[tripId];
     if (!trip || index < 0 || index >= trip.expenses.length || trip.expenses[index] !== expected) {
       throw new Error("The expense list changed. Review the damaged entry again.");
     }
     const entry = trip.expenses[index];
     if (typeof entry?.id === "string" && entry.id) {
-      if (!trip.syncEnabled) return this.deleteExpense(tripId, entry.id);
+      if (!trip.syncEnabled) {
+        if (restoreOnly) throw new Error("This expense has no shared server copy. The saved details have been kept.");
+        return this.deleteExpense(tripId, entry.id);
+      }
       if (!this.canSync()) throw new Error("Sign in and reconnect to repair this shared expense.");
       const epoch = this.epoch;
-      await this.flush();
-      if (epoch !== this.epoch) return;
-      const server = await this.api.getTrip(tripId);
-      if (epoch !== this.epoch) return;
-      if (!server) throw new Error("Couldn't reload this shared expense. Try again while online.");
-      const current = this.data.trips[tripId];
-      if (!current || current.expenses[index] !== expected) throw new Error("The expense list changed. Review the damaged entry again.");
-      if (server.revision != null && current.revision != null && server.revision < current.revision) {
-        throw new Error("The server returned an older trip. Try again shortly.");
+      const restorationKey = JSON.stringify([epoch, tripId, entry.id]);
+      if (restoreOnly) {
+        if (this.receiptRestorations.has(restorationKey)) throw new Error("This receipt is already being restored.");
+        this.receiptRestorations.add(restorationKey);
       }
-      const remote = server.expenses.find((expense) => expense?.id === entry.id);
-      // The repair confirmation also discards unsent versions of this damaged record.
-      const keep = (op: Op) => !(op.tripId === tripId && op.kind === "upsertExpense" && op.expense.id === entry.id);
-      this.update((data) => ({ ...data, ops: data.ops.filter(keep), failedOps: data.failedOps.filter(keep) }));
-      if (!remote || inspectLedger({ ...server, expenses: [remote] }).ledger) {
-        this.adopt(server);
-        return;
+      try {
+        const keep = (op: Op) => !(op.tripId === tripId && op.kind === "upsertExpense" && op.expense.id === entry.id);
+        // drainQueue holds this record's pending edits until the server copy is validated.
+        if (restoreOnly) await this.flushing;
+        else await this.flush();
+        if (epoch !== this.epoch) return;
+        const server = await this.api.getTrip(tripId);
+        if (epoch !== this.epoch) return;
+        if (!server) throw new Error("Couldn't reload this shared expense. Try again while online.");
+        const current = this.data.trips[tripId];
+        if (!current || current.expenses[index] !== expected) throw new Error("The expense list changed. Review the damaged entry again.");
+        if (server.revision != null && current.revision != null && server.revision < current.revision) {
+          throw new Error("The server returned an older trip. Try again shortly.");
+        }
+        const remote = server.expenses.find((expense) => expense?.id === entry.id);
+        if (restoreOnly && (!remote?.receipt || !inspectLedger({ ...server, expenses: [remote] }).ledger ||
+            receiptItemsNeedRepair(remote.receipt))) {
+          throw new Error("No intact server receipt was found. The saved details have been kept.");
+        }
+        // The repair confirmation also discards unsent versions of this damaged record.
+        this.update((data) => ({ ...data, ops: data.ops.filter(keep), failedOps: data.failedOps.filter(keep) }));
+        if (!remote || inspectLedger({ ...server, expenses: [remote] }).ledger) {
+          this.adopt(server);
+          return;
+        }
+        return this.deleteExpense(tripId, entry.id);
+      } finally {
+        if (restoreOnly) this.receiptRestorations.delete(restorationKey);
       }
-      return this.deleteExpense(tripId, entry.id);
     }
+    if (restoreOnly) throw new Error("This expense has no shared server copy. The saved details have been kept.");
     this.update((data) => ({ ...data, trips: { ...data.trips,
       [tripId]: { ...trip, expenses: trip.expenses.filter((_, position) => position !== index) },
     } }));
@@ -694,6 +715,7 @@ export class TripRepository {
     const epoch = this.epoch;
     while (this.canSync() && epoch === this.epoch && this.data.ops.length) {
       const op = this.data.ops[0];
+      if (op.kind === "upsertExpense" && this.receiptRestorations.has(JSON.stringify([epoch, op.tripId, op.expense.id]))) return;
       if ((op.retryAt ?? 0) > Date.now()) return;
       try {
         const server = await this.send(op);

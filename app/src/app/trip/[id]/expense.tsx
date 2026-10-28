@@ -16,7 +16,7 @@ import { findDuplicate, type DuplicateMatch } from "../../../lib/duplicates";
 import { formatMoney, fromMinor, parseAmount, parseRate, toMinor } from "../../../lib/money";
 import { describeAge, rateService } from "../../../lib/rates";
 import { pickReceiptImage, type ImageSource } from "../../../lib/receiptImage";
-import { isCurrencyCode, isISODate, normalizeReceiptQuantities, receiptFromScan } from "../../../lib/receiptScan";
+import { isCurrencyCode, isISODate, normalizeReceiptQuantities, receiptFromScan, receiptItemsNeedRepair } from "../../../lib/receiptScan";
 import { computeItemizedBreakdown, computeShares } from "../../../lib/split";
 import {
   CATEGORIES,
@@ -46,12 +46,48 @@ type Params = { id: string; expenseId?: string; scan?: ImageSource; queuedId?: s
 
 export default function ExpenseScreen() {
   const { styles } = useTheme();
+  const { deleteExpense, removeDamagedExpense, saveChanges } = useTripActions();
+  const [repairing, setRepairing] = useState(false);
   const params = useLocalSearchParams<Params>();
   const trip = useTrip(params.id);
   if (!trip) {
     return (
       <View style={[styles.screen, styles.content]}>
         <Text style={styles.muted}>Trip not found on this device.</Text>
+      </View>
+    );
+  }
+  const existing = trip.expenses.find((expense) => expense.id === params.expenseId);
+  if (existing?.receipt && receiptItemsNeedRepair(existing.receipt)) {
+    return (
+      <View style={[styles.screen, styles.content]}>
+        <Stack.Screen options={{ title: "Receipt needs repair" }} />
+        <Banner>This receipt&apos;s saved item details can&apos;t be edited safely. The original details have been kept.</Banner>
+        {trip.syncEnabled && <Button title="Restore server copy" loading={repairing} onPress={() =>
+          Alert.alert("Restore this expense?", "An intact server copy will replace this expense. Unsent edits to this expense will be discarded. If no intact copy is available, your saved details will be kept.", [
+            { text: "Cancel", style: "cancel" },
+            { text: "Restore", onPress: async () => {
+              setRepairing(true);
+              try {
+                await removeDamagedExpense(trip.id, trip.expenses.indexOf(existing), existing, true);
+                await saveChanges();
+              } catch (error) {
+                Alert.alert("Couldn't restore the receipt", error instanceof Error ? error.message : "Try again while online.");
+              } finally { setRepairing(false); }
+            } },
+          ])
+        } />}
+        <Text style={styles.muted}>To replace the receipt, delete this expense and add it again from the original receipt.</Text>
+        <Button title="Delete expense" variant="danger" onPress={() =>
+          Alert.alert("Delete this expense?", "This removes the expense and its saved receipt details for everyone on the trip. You can add it again from the original receipt.", [
+            { text: "Cancel", style: "cancel" },
+            { text: "Delete", style: "destructive", onPress: () => {
+              deleteExpense(trip.id, existing.id);
+              router.back();
+            } },
+          ])
+        } />
+        <Button title="Back to trip" onPress={() => router.back()} />
       </View>
     );
   }

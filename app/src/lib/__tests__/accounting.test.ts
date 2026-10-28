@@ -4,7 +4,7 @@ import { Ledger, inspectLedger } from "../ledger";
 import { computeItemizedBreakdown, computeShares } from "../split";
 import { CoalescedWriter, MemoryStorage } from "../storage";
 import { expense, trip } from "./fixtures";
-import { normalizeReceiptQuantities } from "../receiptScan";
+import { normalizeReceiptQuantities, receiptItemsNeedRepair } from "../receiptScan";
 import type { Expense, ReceiptData } from "../types";
 
 
@@ -100,5 +100,21 @@ test("legacy receipt quantities normalize for editing without changing positive 
 
 test("metadata-only legacy receipts open with an empty item list and retain their metadata", () => {
   const receipt = { merchant: "Legacy shop", language: "English", notes: "Retained notes" } as ReceiptData;
+  assert.equal(receiptItemsNeedRepair(receipt), false);
   assert.deepEqual(normalizeReceiptQuantities(receipt), { ...receipt, items: [] });
+});
+
+test("malformed receipt item lists require repair without discarding their original details", () => {
+  for (const items of [{ meal: { name: "Dinner", quantity: 1, price: 12 } }, null, "Dinner", 12, false,
+    [null], ["Dinner"], [12], [false], [[]], [{}], [{ name: "Dinner", price: "12" }],
+    [{ name: "Dinner", price: 12, translatedName: { text: "Dinner" } }]]) {
+    const receipt = { merchant: "Legacy shop", language: "English", notes: "Retained notes", items } as unknown as ReceiptData;
+    const original = structuredClone(receipt);
+    assert.equal(receiptItemsNeedRepair(receipt), true);
+    assert.throws(() => normalizeReceiptQuantities(receipt), /need repair before editing/);
+    assert.deepEqual(receipt, original);
+  }
+  const receipt = { merchant: null, merchantTranslated: null, language: "English", notes: null, items: [] };
+  assert.equal(receiptItemsNeedRepair(receipt), false);
+  assert.deepEqual(normalizeReceiptQuantities(receipt), receipt);
 });
