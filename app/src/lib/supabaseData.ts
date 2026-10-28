@@ -84,9 +84,8 @@ function toMember(row: Record<string, any>): Member {
 function toExpense(row: Record<string, any>): Expense {
   const amount = Number(row.amount);
   const rateToBase = Number(row.rate_to_base ?? row.rateToBase);
-  if (!Number.isFinite(amount) || amount <= 0 || !Number.isFinite(rateToBase) || rateToBase <= 0) {
-    throw new ApiError("Invalid expense data", 502, false);
-  }
+  // Preserve damaged historical accounting values for explicit repair.
+  // inspectLedger withholds all totals until nonpositive/nonfinite values are repaired.
   return {
     id: row.id,
     description: row.description ?? row.title ?? "",
@@ -118,7 +117,12 @@ export const supabaseData = {
       // RLS restricts this list to trips the authenticated account can read.
       const { data, error } = await supabase.from("trips").select("*, trip_members(*), expenses(*)");
       if (error) throw new ApiError(error.message, supabaseErrorStatus(error.code));
-      return (data ?? []).map(toTrip);
+      const trips: Trip[] = [];
+      for (const row of data ?? []) {
+        try { trips.push(toTrip(row)); }
+        catch (error) { console.warn("Skipping unreadable trip", row?.id, error); }
+      }
+      return trips;
     }, async () => { throw new ApiError("Trip sync is unavailable", 503); });
   },
   async getTrip(id: string, knownVersion?: number): Promise<Trip | null> {

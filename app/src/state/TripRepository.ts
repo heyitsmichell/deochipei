@@ -1,6 +1,7 @@
 import type { api as defaultApi } from "../lib/api";
 import { ApiError } from "../lib/errors";
 import { isInviteExpired } from "../lib/invite";
+import { inspectLedger } from "../lib/ledger";
 import { CoalescedWriter, type KeyValueStorage } from "../lib/storage";
 import { isTripPreview, newId, type TripLookup, type Expense, type Member, type ThemePreference, type Trip } from "../lib/types";
 
@@ -27,6 +28,8 @@ export interface Settings {
 
 export interface PersistedData {
   accountId?: string | null;
+  /** Trips hidden on this device, scoped to the account that removed them. */
+  removedTripIds?: Record<string, string[]>;
   /** Legacy offline work whose account could not be established; never synced automatically. */
   unverified?: { trips: Record<string, Trip>; ops: Op[]; failedOps: Op[]; me: Record<string, string> };
   trips: Record<string, Trip>;
@@ -66,7 +69,7 @@ export function applyOp(trip: Trip, op: Op): Trip {
     case "deleteExpense":
       return {
         ...trip,
-        expenses: trip.expenses.filter((e) => e.id !== op.expenseId),
+        expenses: trip.expenses.filter((e) => e?.id !== op.expenseId),
         deletedExpenseIds: trip.deletedExpenseIds.includes(op.expenseId)
           ? trip.deletedExpenseIds
           : [...trip.deletedExpenseIds, op.expenseId],
@@ -75,7 +78,7 @@ export function applyOp(trip: Trip, op: Op): Trip {
 }
 
 function upsertById<T extends { id: string }>(list: T[], item: T): T[] {
-  const i = list.findIndex((x) => x.id === item.id);
+  const i = list.findIndex((x) => x?.id === item.id);
   return i === -1 ? [...list, item] : list.map((x, j) => (j === i ? item : x));
 }
 
@@ -118,6 +121,8 @@ export class TripRepository {
       await this.ready();
       if (request !== this.accountRequest) return;
       const cachedAccount = this.data.accountId;
+      let cleanupError: unknown;
+      let cleanupFailed = false;
       if (cachedAccount === undefined) {
         // Keep verifiable trips active. Retain uncertain legacy work separately
         // until the server confirms access, without sending it as another user.
@@ -136,20 +141,21 @@ export class TripRepository {
             failedOps: data.failedOps.filter((op) => !uncertain.has(op.tripId)),
             me: Object.fromEntries(Object.entries(data.me).filter(([tripId]) => !uncertain.has(tripId))),
           }));
-          await beforeReset("migrate");
+          try { await beforeReset("migrate"); }
+          catch (error) { cleanupError = error; cleanupFailed = true; }
         }
       } else if (cachedAccount !== id) {
-        let cleanupError: unknown;
         try { await beforeReset("reset"); }
-        catch (error) { cleanupError = error; }
+        catch (error) { cleanupError = error; cleanupFailed = true; }
         if (request !== this.accountRequest) return;
-        await this.resetForAccount();
-        if (cleanupError) throw cleanupError;
+        try { await this.resetForAccount(); }
+        catch (error) { if (!cleanupFailed) cleanupError = error; cleanupFailed = true; }
       }
       if (request !== this.accountRequest) return;
       this.update((data) => ({ ...data, accountId: id }));
       this.accountId = id;
       this.accountRestoreNeeded = !!id;
+      if (cleanupFailed) throw cleanupError;
     });
     this.accountTransition = transition;
     return transition.then(async () => {
@@ -169,6 +175,7 @@ export class TripRepository {
         const trips = await this.api.listTrips();
         if (epoch !== this.epoch) return;
         for (const trip of trips) {
+          if (this.data.removedTripIds?.[id]?.includes(trip.id)) continue;
           this.adopt(trip, { allowNew: true });
           const member = trip.members.find((candidate) => candidate.userId === id);
           if (member) this.setMe(trip.id, member.id);
@@ -356,6 +363,7 @@ export class TripRepository {
       this.adopt(updated, { allowNew: true });
       this.previews.delete(tripId);
     }
+    this.clearRemovedTrip(tripId);
     this.setMe(tripId, memberId, user);
   };
 
@@ -398,6 +406,7 @@ export class TripRepository {
         }));
       }
     }
+    this.clearRemovedTrip(resolvedTrip.id);
     this.adopt(resolvedTrip, { allowNew: true });
     return resolvedTrip;
   };
@@ -411,6 +420,7 @@ export class TripRepository {
     if (!code) throw new ApiError("This trip has no invite code yet. Try again once it has synced.", 409);
     const updated = await this.api.claimMember(code, member.id, member);
     if (epoch !== this.epoch) return;
+    this.clearRemovedTrip(tripId);
     this.adopt(updated, { allowNew: true });
     this.previews.delete(tripId);
     this.setMe(tripId, member.id, user);
@@ -500,12 +510,54 @@ export class TripRepository {
     if (trip.syncEnabled) this.enqueue({ kind: "deleteExpense", tripId, expenseId });
   };
 
+  /** Confirmed repair restores intact server data before considering shared deletion. */
+  removeDamagedExpense = async (tripId: string, index: number, expected: unknown) => {
+    const trip = this.data.trips[tripId];
+    if (!trip || index < 0 || index >= trip.expenses.length || trip.expenses[index] !== expected) {
+      throw new Error("The expense list changed. Review the damaged entry again.");
+    }
+    const entry = trip.expenses[index];
+    if (typeof entry?.id === "string" && entry.id) {
+      if (!trip.syncEnabled) return this.deleteExpense(tripId, entry.id);
+      if (!this.canSync()) throw new Error("Sign in and reconnect to repair this shared expense.");
+      const epoch = this.epoch;
+      await this.flush();
+      if (epoch !== this.epoch) return;
+      const server = await this.api.getTrip(tripId);
+      if (epoch !== this.epoch) return;
+      if (!server) throw new Error("Couldn't reload this shared expense. Try again while online.");
+      const current = this.data.trips[tripId];
+      if (!current || current.expenses[index] !== expected) throw new Error("The expense list changed. Review the damaged entry again.");
+      if (server.revision != null && current.revision != null && server.revision < current.revision) {
+        throw new Error("The server returned an older trip. Try again shortly.");
+      }
+      const remote = server.expenses.find((expense) => expense?.id === entry.id);
+      // The repair confirmation also discards unsent versions of this damaged record.
+      const keep = (op: Op) => !(op.tripId === tripId && op.kind === "upsertExpense" && op.expense.id === entry.id);
+      this.update((data) => ({ ...data, ops: data.ops.filter(keep), failedOps: data.failedOps.filter(keep) }));
+      if (!remote || inspectLedger({ ...server, expenses: [remote] }).ledger) {
+        this.adopt(server);
+        return;
+      }
+      return this.deleteExpense(tripId, entry.id);
+    }
+    this.update((data) => ({ ...data, trips: { ...data.trips,
+      [tripId]: { ...trip, expenses: trip.expenses.filter((_, position) => position !== index) },
+    } }));
+  };
+
   removeTripLocally = (tripId: string) =>
     this.update((d) => {
       const { [tripId]: _removed, ...trips } = d.trips;
+      const { [tripId]: _me, ...me } = d.me;
+      const account = d.accountId;
       return {
         ...d,
         trips,
+        me,
+        ...(account && _removed?.syncEnabled ? { removedTripIds: { ...d.removedTripIds,
+          [account]: [...new Set([...(d.removedTripIds?.[account] ?? []), tripId])],
+        } } : {}),
         ops: d.ops.filter((o) => o.tripId !== tripId),
         failedOps: d.failedOps.filter((o) => o.tripId !== tripId),
       };
@@ -571,6 +623,14 @@ export class TripRepository {
   };
 
   // ── Internals ───────────────────────────────────────────────────────────
+
+  private clearRemovedTrip(tripId: string) {
+    const account = this.data.accountId;
+    if (!account || !this.data.removedTripIds?.[account]?.includes(tripId)) return;
+    this.update((data) => ({ ...data, removedTripIds: { ...data.removedTripIds,
+      [account]: data.removedTripIds![account].filter((id) => id !== tripId),
+    } }));
+  }
 
   private member(tripId: string, memberId: string | undefined) {
     return this.data.trips[tripId]?.members.find((m) => m.id === memberId);
@@ -789,6 +849,7 @@ export class TripRepository {
         me: Object.fromEntries(Object.entries(this.data.me).filter(([tripId]) => guestIds.has(tripId))),
         settings: this.data.settings,
         unverified: this.data.unverified,
+        removedTripIds: this.data.removedTripIds,
       },
       ready: true,
     };

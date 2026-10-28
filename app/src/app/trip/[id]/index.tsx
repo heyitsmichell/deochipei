@@ -62,19 +62,22 @@ export default function TripScreen() {
 
 function TripView({ trip }: { trip: Trip }) {
   const { styles } = useTheme();
-  const { deleteExpense, saveChanges } = useTripActions();
+  const { removeDamagedExpense, saveChanges } = useTripActions();
   const result = useMemo(() => inspectLedger(trip), [trip]);
   if (result.ledger) return <TripContent trip={trip} ledger={result.ledger} />;
   return <View style={[styles.screen, styles.content]}>
     <Text style={styles.h2}>An expense needs correction</Text>
     <Text style={styles.muted}>Totals and settlements are unavailable until damaged expenses are removed and entered again. Other expenses are still kept.</Text>
-    {result.invalid.map((expense) => <Card key={expense.id}>
+    {result.invalid.map((expense) => <Card key={expense.index}>
       <Text style={styles.h2}>{expense.description || "Damaged expense"}</Text>
-      <Text style={styles.muted}>Record: {expense.id}</Text>
-      <Button title="Remove damaged expense" variant="danger" onPress={() => Alert.alert("Remove damaged expense?", "Keep any details you need, then enter the expense again.", [
+      <Text style={styles.muted}>Record: {expense.id ?? `entry ${expense.index + 1}`}</Text>
+      <Button title={expense.id && trip.syncEnabled ? "Repair shared expense" : "Remove damaged expense"} variant="danger" onPress={() => Alert.alert("Repair damaged expense?",
+        expense.id && trip.syncEnabled
+          ? "An intact server copy will be restored. If the server copy is also damaged, the expense will be removed for everyone. Unsent edits to this expense will be discarded. Keep any details you need before confirming."
+          : "Keep any details you need, then enter the expense again.", [
         { text: "Cancel", style: "cancel" },
         { text: "Remove", style: "destructive", onPress: async () => {
-          try { deleteExpense(trip.id, expense.id); await saveChanges(); }
+          try { await removeDamagedExpense(trip.id, expense.index, expense.value); await saveChanges(); }
           catch (error) { Alert.alert("Couldn't save the removal", error instanceof Error ? error.message : "Try again."); }
         } },
       ])} />

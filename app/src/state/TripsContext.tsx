@@ -49,6 +49,7 @@ const actions = {
   patchTrip: repository.patchTrip,
   saveExpense: repository.saveExpense,
   deleteExpense: repository.deleteExpense,
+  removeDamagedExpense: repository.removeDamagedExpense,
   retryFailed: repository.retryFailed,
   discardFailed: repository.discardFailed,
   removeTripLocally: repository.removeTripLocally,

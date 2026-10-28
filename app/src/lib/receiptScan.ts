@@ -9,6 +9,14 @@ export const isISODate = (date: string | null): date is string => {
   return parsed.getUTCFullYear() === year && parsed.getUTCMonth() === month - 1 && parsed.getUTCDate() === day;
 };
 
+/** Older receipts could retain unusable quantities; line prices are already totals. */
+export function normalizeReceiptQuantities(receipt: ReceiptData): ReceiptData {
+  const items = Array.isArray(receipt.items) ? receipt.items : [];
+  return { ...receipt, items: items.map((item) => ({ ...item,
+    quantity: Number.isFinite(item.quantity) && item.quantity > 0 ? item.quantity : 1,
+  })) };
+}
+
 /** The parts of a scan the app keeps on the expense. */
 export function receiptFromScan(r: ReceiptScan): ReceiptData {
   const textOrNull = (value: string | null | undefined) => {

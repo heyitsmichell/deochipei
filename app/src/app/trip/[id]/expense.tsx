@@ -16,7 +16,7 @@ import { findDuplicate, type DuplicateMatch } from "../../../lib/duplicates";
 import { formatMoney, fromMinor, parseAmount, parseRate, toMinor } from "../../../lib/money";
 import { describeAge, rateService } from "../../../lib/rates";
 import { pickReceiptImage, type ImageSource } from "../../../lib/receiptImage";
-import { isCurrencyCode, isISODate, receiptFromScan } from "../../../lib/receiptScan";
+import { isCurrencyCode, isISODate, normalizeReceiptQuantities, receiptFromScan } from "../../../lib/receiptScan";
 import { computeItemizedBreakdown, computeShares } from "../../../lib/split";
 import {
   CATEGORIES,
@@ -101,7 +101,7 @@ function ExpenseEditor({ trip, expenseId, scan, queuedId }: Params & { trip: Tri
   const [assignments, setAssignments] = useState<Record<number, string[]>>(
     existing?.split?.type === "items" && existing.split.assignments ? existing.split.assignments : {},
   );
-  const [receipt, setReceipt] = useState<ReceiptData | undefined>(existing?.receipt);
+  const [receipt, setReceipt] = useState<ReceiptData | undefined>(() => existing?.receipt ? normalizeReceiptQuantities(existing.receipt) : undefined);
   const [taxText, setTaxText] = useState(
     existing?.receipt?.tax != null ? String(existing.receipt.tax) : "",
   );

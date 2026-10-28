@@ -168,17 +168,36 @@ export class Ledger {
   });
 }
 
+export interface InvalidExpense {
+  index: number;
+  id?: string;
+  description: string;
+  value: unknown;
+}
+
+function invalidExpense(value: unknown, index: number): InvalidExpense {
+  const record = value && typeof value === "object" ? value as Partial<Expense> : undefined;
+  return { index, value,
+    id: typeof record?.id === "string" && record.id ? record.id : undefined,
+    description: typeof record?.description === "string" ? record.description : "",
+  };
+}
+
 /** Keep a broken historical record visible for repair without publishing partial totals. */
-export function inspectLedger(trip: Trip): { ledger?: Ledger; invalid: Expense[] } {
-  const invalid = trip.expenses.filter((expense) => {
+export function inspectLedger(trip: Trip): { ledger?: Ledger; invalid: InvalidExpense[] } {
+  const invalid: InvalidExpense[] = [];
+  trip.expenses.forEach((expense, index) => {
     try {
-      if (!isISODate(expense.date) || typeof expense.description !== "string" || !expense.paidBy ||
-          !/^[A-Z]{3}$/.test(expense.currency) || !Array.isArray(expense.split?.memberIds)) return true;
+      if (!expense || typeof expense.id !== "string" || !expense.id || !isISODate(expense.date) ||
+          typeof expense.description !== "string" || !expense.paidBy ||
+          !/^[A-Z]{3}$/.test(expense.currency) || !Array.isArray(expense.split?.memberIds)) {
+        invalid.push(invalidExpense(expense, index));
+        return;
+      }
       new Ledger({ ...trip, expenses: [expense] });
-      return false;
-    } catch { return true; }
+    } catch { invalid.push(invalidExpense(expense, index)); }
   });
   if (invalid.length) return { invalid };
   try { return { ledger: new Ledger(trip), invalid }; }
-  catch { return { invalid: trip.expenses }; }
+  catch { return { invalid: trip.expenses.map(invalidExpense) }; }
 }

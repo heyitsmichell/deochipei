@@ -3,7 +3,8 @@ import { test } from "node:test";
 import { MemoryStorage } from "../../lib/storage";
 import { ApiError } from "../../lib/errors";
 import { expense, trip } from "../../lib/__tests__/fixtures";
-import type { Trip, TripPreview } from "../../lib/types";
+import type { Expense, Trip, TripPreview } from "../../lib/types";
+import { inspectLedger } from "../../lib/ledger";
 import { TripRepository, type TripApi } from "../TripRepository";
 import { ReceiptQueue } from "../ReceiptQueue";
 
@@ -341,4 +342,157 @@ test("migration holds receipt photos until the user reviews them, including an i
   await queue.process();
   assert.equal(queue.getSnapshot()[0].status, "failed");
   assert.deepEqual(removed, []);
+});
+
+test("damaged entries without IDs can be removed durably without dropping valid expenses", async () => {
+  const { repo, storage } = await repository({}, trip({ syncEnabled: false,
+    expenses: [expense({ id: "good" }), null, {}, expense({ id: "bad", rateToBase: 0 })] as Expense[] }));
+  let invalid = inspectLedger(repo.getTrip("trip")!).invalid;
+  await repo.removeDamagedExpense("trip", invalid[2].index, invalid[2].value);
+  invalid = inspectLedger(repo.getTrip("trip")!).invalid;
+  const stale = invalid[1];
+  await repo.removeDamagedExpense("trip", invalid[0].index, invalid[0].value);
+  await assert.rejects(repo.removeDamagedExpense("trip", stale.index, stale.value), /list changed/);
+  invalid = inspectLedger(repo.getTrip("trip")!).invalid;
+  await repo.removeDamagedExpense("trip", invalid[0].index, invalid[0].value);
+  await repo.saved();
+  assert.equal(inspectLedger(repo.getTrip("trip")!).ledger!.totalSpent, 10);
+  assert.deepEqual(JSON.parse((await storage.getItem("repo"))!).trips.trip.expenses.map((e: Expense) => e.id), ["good"]);
+  assert.equal(repo.pendingCount("trip"), 0);
+});
+
+test("confirmed shared repair restores an intact server expense and keeps unrelated rejected edits", async () => {
+  const bad = expense({ rateToBase: 0 });
+  const { repo } = await repository({ getTrip: async () => trip(), deleteExpense: async () => assert.fail("Must not delete an intact server expense"),
+    upsertExpense: async () => { throw new ApiError("Invalid", 400); } });
+  repo.saveExpense("trip", expense({ id: "other", amount: 12 }));
+  repo.saveExpense("trip", bad);
+  await repo.flush();
+  const damaged = repo.getTrip("trip")!.expenses.find((entry) => entry.id === bad.id)!;
+  await repo.removeDamagedExpense("trip", 0, damaged);
+  assert.equal(repo.getTrip("trip")!.expenses[0].rateToBase, 1);
+  assert.equal(repo.getTrip("trip")!.expenses[1].amount, 12);
+  assert.equal(repo.failedCount("trip"), 1);
+  await repo.saved();
+});
+
+test("shared repair deletes only a server-confirmed damaged expense", async () => {
+  const bad = expense({ rateToBase: 0 });
+  let deleted = 0;
+  const { repo } = await repository({ getTrip: async () => trip({ expenses: [bad] }), deleteExpense: async (_tripId, id) => {
+    assert.equal(id, bad.id); deleted++;
+    return trip({ revision: 2, expenses: [] });
+  } }, trip({ expenses: [bad] }));
+  await repo.removeDamagedExpense("trip", 0, repo.getTrip("trip")!.expenses[0]);
+  await repo.flush();
+  assert.equal(deleted, 1);
+  assert.deepEqual(repo.getTrip("trip")!.expenses, []);
+});
+
+test("offline shared repair preserves the damaged entry and never queues deletion", async () => {
+  const { repo } = await repository({ getTrip: async () => { throw new Error("offline"); },
+    deleteExpense: async () => assert.fail("Must not delete offline") }, trip({ expenses: [expense({ rateToBase: 0 })] }));
+  const original = repo.getTrip("trip")!.expenses[0];
+  await assert.rejects(repo.removeDamagedExpense("trip", 0, original), /offline/);
+  assert.equal(repo.getTrip("trip")!.expenses[0], original);
+  assert.equal(repo.pendingCount("trip"), 0);
+});
+
+test("a delayed shared repair cannot change a different account's trip", async () => {
+  let resolve!: (trip: Trip) => void;
+  const { repo } = await repository({ getTrip: () => new Promise((done) => { resolve = done; }) }, trip({ expenses: [expense({ rateToBase: 0 })] }));
+  const repairing = repo.removeDamagedExpense("trip", 0, repo.getTrip("trip")!.expenses[0]);
+  await new Promise((done) => setImmediate(done));
+  await repo.setAccount(null);
+  resolve(trip());
+  await repairing;
+  assert.equal(repo.getTrip("trip"), undefined);
+  assert.equal(repo.pendingCount("trip"), 0);
+});
+
+for (const failure of ["reset callback", "reset write", "migrate callback"]) {
+  test(`account setup remains retryable after a ${failure} failure`, async () => {
+    const storage = new MemoryStorage();
+    const migrate = failure === "migrate callback";
+    await storage.setItem("repo", JSON.stringify({ ...(migrate ? {} : { accountId: "owner" }),
+      trips: { trip: trip({ ownerId: undefined, members: [{ id: "a", name: "Unbound" }] }) }, ops: [], failedOps: [], me: {} }));
+    let failWrite = failure === "reset write";
+    let calls = 0;
+    const repo = new TripRepository({ listTrips: async () => { calls++; return [trip()]; } } as TripApi,
+      { getItem: storage.getItem.bind(storage), setItem: async (key, value) => {
+        if (failWrite) throw new Error("cleanup failed");
+        await storage.setItem(key, value);
+      } }, "repo");
+    await assert.rejects(repo.setAccount("member", async (mode) => {
+      assert.equal(mode, migrate ? "migrate" : "reset");
+      if (failure !== "reset write") throw new Error("cleanup failed");
+    }), /cleanup failed/);
+    assert.equal(repo.canSync(), true);
+    assert.equal(repo.getSnapshot().data.accountId, "member");
+    assert.equal(calls, 0);
+    failWrite = false;
+    await repo.restoreAccount();
+    await repo.saved();
+    assert.equal(calls, 1);
+    assert.equal(repo.getTrip("trip")!.id, "trip");
+  });
+}
+
+for (const mode of ["reset", "migrate"] as const) {
+  test(`a stale ${mode} cleanup cannot overwrite the latest account`, async () => {
+    const storage = new MemoryStorage();
+    await storage.setItem("repo", JSON.stringify({ ...(mode === "reset" ? { accountId: "owner" } : {}),
+      trips: { trip: trip({ ownerId: undefined, members: [] }) }, ops: [], failedOps: [], me: {} }));
+    const repo = new TripRepository({ listTrips: async () => [] } as unknown as TripApi, storage, "repo");
+    let started!: () => void;
+    const waiting = new Promise<void>((resolve) => { started = resolve; });
+    let release!: () => void;
+    const old = repo.setAccount("member", async () => {
+      started();
+      await new Promise<void>((resolve) => { release = resolve; });
+      throw new Error("stale cleanup failed");
+    });
+    await waiting;
+    const current = repo.setAccount("owner");
+    release();
+    await Promise.all([old, current]);
+    assert.equal(repo.getSnapshot().data.accountId, "owner");
+    assert.equal(repo.canSync(), true);
+  });
+}
+
+test("removed trips stay hidden after restart, are account scoped and return after explicitly joining", async () => {
+  const { repo, storage } = await repository();
+  repo.removeTripLocally("trip");
+  await repo.saved();
+  const restored = new TripRepository({ listTrips: async () => [trip()], joinTrip: async () => trip() } as unknown as TripApi, storage, "repo");
+  await restored.setAccount("owner");
+  assert.equal(restored.getTrip("trip"), undefined);
+  assert.equal(restored.meFor("trip"), undefined);
+  await restored.setAccount("member");
+  assert.ok(restored.getTrip("trip"));
+  await restored.setAccount("owner");
+  assert.equal(restored.getTrip("trip"), undefined);
+  await restored.joinTrip("ABCDEF1234", { id: "owner" });
+  assert.ok(restored.getTrip("trip"));
+  assert.deepEqual(restored.getSnapshot().data.removedTripIds!.owner, []);
+  await restored.saved();
+});
+
+test("only a successful claim clears a removed trip marker", async () => {
+  const preview: TripPreview = { preview: true, id: "trip", code: "ABCDEF1234", name: "Preview", baseCurrency: "USD", members: [{ id: "b", name: "Bob" }] };
+  let fail = true;
+  const { repo } = await repository({ joinTrip: async () => preview, claimMember: async () => {
+    if (fail) throw new ApiError("Unavailable", 503);
+    return trip({ members: [{ id: "b", name: "Bob", userId: "owner" }] });
+  } });
+  repo.removeTripLocally("trip");
+  await repo.joinTrip("ABCDEF1234", { id: "owner" });
+  assert.deepEqual(repo.getSnapshot().data.removedTripIds!.owner, ["trip"]);
+  await assert.rejects(repo.claimTripMember("trip", "b", { id: "owner" }));
+  assert.deepEqual(repo.getSnapshot().data.removedTripIds!.owner, ["trip"]);
+  fail = false;
+  await repo.claimTripMember("trip", "b", { id: "owner" });
+  assert.deepEqual(repo.getSnapshot().data.removedTripIds!.owner, []);
+  assert.equal(repo.meFor("trip"), "b");
 });

@@ -24,14 +24,27 @@ test("expense validation requires a complete, finite accounting record", () => {
   }
 });
 
-test("null, blank, and missing model quantities default to one; invalid quantities are rejected", () => {
-  for (const quantity of [undefined, null, "", "2", 3]) {
+test("unusable model quantities default to one without changing line totals", () => {
+  for (const quantity of [undefined, null, "", " ", 0, -1, "bad", Infinity, "Infinity", true, {}, [], "2", 3]) {
     const scan = ReceiptSchema.parse({ is_receipt: true, currency: "USD", total: 10, items: [{ name: "Item", total_price: 10, quantity }] });
     assert.equal(scan.items[0].quantity, quantity === "2" ? 2 : quantity === 3 ? 3 : 1);
+    assert.equal(scan.items[0].total_price, 10);
   }
-  for (const quantity of [0, -1, "bad"]) {
-    assert.equal(ReceiptSchema.safeParse({ is_receipt: true, currency: "USD", total: 10, items: [{ name: "Item", total_price: 10, quantity }] }).success, false);
+});
+
+test("item splits require receipt items and canonical indexes within that receipt", () => {
+  const receipt = { merchant: null, merchantTranslated: null, language: "English", notes: null,
+    items: [{ name: "Meal", translatedName: null, quantity: 1, price: 10 }] };
+  const itemExpense = { ...expense, receipt, split: { type: "items", memberIds: ["a", "b"], assignments: { 0: ["a"] } } };
+  assert.equal(ExpenseSchema.safeParse(itemExpense).success, true);
+  assert.equal(ExpenseSchema.safeParse({ ...itemExpense, receipt: undefined }).success, false);
+  assert.equal(ExpenseSchema.safeParse({ ...itemExpense, receipt: { ...receipt, items: [] } }).success, false);
+  for (const index of ["1", "-1", "0.5", "00", "9007199254740992"]) {
+    assert.equal(ExpenseSchema.safeParse({ ...itemExpense, split: { ...itemExpense.split, assignments: { [index]: ["a"] } } }).success, false, index);
   }
+  assert.equal(ExpenseSchema.safeParse({ ...itemExpense, split: { ...itemExpense.split, assignments: {} } }).success, true);
+  assert.equal(ExpenseSchema.safeParse({ ...expense, receipt: { ...receipt, items: [] } }).success, true);
+  assert.equal(ExpenseSchema.safeParse({ ...itemExpense, receipt: { ...receipt, items: [{ ...receipt.items[0], quantity: 0 }] } }).success, false);
 });
 
 test("API rejects malformed writes, permits polling preflight, and protects invite previews", async () => {

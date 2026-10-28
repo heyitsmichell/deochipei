@@ -4,6 +4,8 @@ import { Ledger, inspectLedger } from "../ledger";
 import { computeItemizedBreakdown, computeShares } from "../split";
 import { CoalescedWriter, MemoryStorage } from "../storage";
 import { expense, trip } from "./fixtures";
+import { normalizeReceiptQuantities } from "../receiptScan";
+import type { Expense, ReceiptData } from "../types";
 
 
 test("failed writes reject current and later acknowledgements and can recover", async () => {
@@ -75,4 +77,28 @@ test("damaged expenses stay identified and totals remain unavailable", () => {
   assert.equal(result.ledger, undefined);
   assert.deepEqual(result.invalid.map((e) => e.id), ["expense"]);
   assert.throws(() => new Ledger(trip({ expenses: [bad] })), /Invalid expense/);
+});
+
+test("null, primitive and id-less persisted expenses have safe repair descriptors", () => {
+  const malformed = [null, "bad", 7, {}, expense({ id: undefined as unknown as string })];
+  const result = inspectLedger(trip({ expenses: [expense(), ...malformed as Expense[]] }));
+  assert.equal(result.ledger, undefined);
+  assert.deepEqual(result.invalid.map((entry) => entry.index), [1, 2, 3, 4, 5]);
+  assert.deepEqual(result.invalid.map((entry) => entry.id), [undefined, undefined, undefined, undefined, undefined]);
+  assert.deepEqual(result.invalid.map((entry) => entry.value), malformed);
+  assert.ok(result.invalid.every((entry) => typeof entry.description === "string"));
+});
+
+test("legacy receipt quantities normalize for editing without changing positive quantities or line totals", () => {
+  const receipt = { merchant: null, merchantTranslated: null, language: "English", notes: null,
+    items: [0, -2, NaN, Infinity, 0.5, 3].map((quantity, i) => ({ name: `Item ${i}`, translatedName: null, quantity, price: i === 1 ? -1 : 10 })) };
+  const normalized = normalizeReceiptQuantities(receipt);
+  assert.deepEqual(normalized.items.map((item) => item.quantity), [1, 1, 1, 1, 0.5, 3]);
+  assert.deepEqual(normalized.items.map((item) => item.price), receipt.items.map((item) => item.price));
+  assert.equal(receipt.items[0].quantity, 0);
+});
+
+test("metadata-only legacy receipts open with an empty item list and retain their metadata", () => {
+  const receipt = { merchant: "Legacy shop", language: "English", notes: "Retained notes" } as ReceiptData;
+  assert.deepEqual(normalizeReceiptQuantities(receipt), { ...receipt, items: [] });
 });
