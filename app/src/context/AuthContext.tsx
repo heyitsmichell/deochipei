@@ -6,7 +6,7 @@ import { AppState } from "react-native";
 import React, { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
 import { extractParamsFromUrl, handleAuthUrl, isAuthCallbackUrl } from "../lib/authUrl";
 import { supabase } from "../lib/supabase";
-import { resetLocalAccountState } from "../state/TripsContext";
+import { resetLocalAccountState, synchronizeAccount } from "../state/TripsContext";
 
 export { extractParamsFromUrl, handleAuthUrl };
 
@@ -67,7 +67,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         setUser(currentSession?.user ?? null);
         setLoading(false);
       }
-      if (_event === "SIGNED_OUT") void resetLocalAccountState();
+
     });
 
     // Deep link listener for OAuth redirect callback
@@ -98,6 +98,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       sub.remove();
     };
   }, []);
+
+  // Run outside Supabase's auth callback so API calls cannot block its auth lock.
+  useEffect(() => {
+    if (loading) return;
+    void synchronizeAccount(user?.id ?? null).catch((error) => console.warn("Account data could not be restored", error));
+  }, [user?.id, loading]);
 
   const signInWithGoogle = async () => {
     try {

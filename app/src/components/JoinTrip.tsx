@@ -2,9 +2,10 @@ import { router } from "expo-router";
 import { useEffect, useRef, useState } from "react";
 import { ScrollView, Text, View } from "react-native";
 import { useAuth } from "../context/AuthContext";
+import { canAddSelfOnJoin } from "../lib/api";
 import { ApiError } from "../lib/errors";
 import { parseInviteCode } from "../lib/invite";
-import type { Trip } from "../lib/types";
+import type { TripLookup } from "../lib/types";
 import { useTripActions } from "../state/TripsContext";
 import { QrScanner } from "./QrScanner";
 import { Button, Card, Chip, Field, useTheme } from "./ui";
@@ -16,11 +17,11 @@ import { Button, Card, Chip, Field, useTheme } from "./ui";
 export function JoinTrip({ initialCode }: { initialCode?: string }) {
   const { colors, styles } = useTheme();
   const { user, loading: authLoading, displayName: authDisplayName, email: authEmail, avatarUrl: authAvatarUrl } = useAuth();
-  const { joinTrip, claimTripMember, addMember, meFor } = useTripActions();
+  const { joinTrip, claimTripMember, addSelfToTrip, meFor } = useTripActions();
   const [code, setCode] = useState(initialCode ?? "");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [trip, setTrip] = useState<Trip | null>(null);
+  const [trip, setTrip] = useState<TripLookup | null>(null);
   const [newName, setNewName] = useState("");
   const [scanning, setScanning] = useState(false);
   const linked = useRef(false);
@@ -45,7 +46,7 @@ export function JoinTrip({ initialCode }: { initialCode?: string }) {
         : undefined;
       const found = await joinTrip(parsed, userInfo);
       // Already part of it on this phone (say, you scanned your own code or bound): just open it.
-      if (meFor(found.id)) {
+      if (!("preview" in found) && meFor(found.id)) {
         router.replace(`/trip/${found.id}`);
         return;
       }
@@ -69,7 +70,7 @@ export function JoinTrip({ initialCode }: { initialCode?: string }) {
   }, [initialCode, authLoading]);
 
   const pick = async (memberId: string) => {
-    if (!trip) return;
+    if (!trip || loading) return;
     const identity = user?.id ? { id: user.id, email: authEmail ?? user.email, avatarUrl: authAvatarUrl } : undefined;
     setError(null);
     setLoading(true);
@@ -97,7 +98,6 @@ export function JoinTrip({ initialCode }: { initialCode?: string }) {
             style={{ fontSize: 22, letterSpacing: 4, fontWeight: "700" }}
           />
           <Button title="Find trip" onPress={() => lookup(code)} loading={loading} disabled={code.trim().length < 6} />
-          {error && <Text style={{ color: colors.negative, marginTop: 10 }}>{error}</Text>}
           <Text style={[styles.muted, { textAlign: "center", marginVertical: 16 }]}>or</Text>
           <Button title="📷 Scan invite QR code" variant="secondary" onPress={() => setScanning(true)} />
           <Text style={[styles.muted, { fontSize: 12, marginTop: 8, textAlign: "center" }]}>
@@ -118,23 +118,30 @@ export function JoinTrip({ initialCode }: { initialCode?: string }) {
           <Text style={[styles.muted, { marginBottom: 12 }]}>Which one is you?</Text>
           <View style={styles.chips}>
             {trip.members.map((m) => (
-              <Chip key={m.id} label={m.name} selected={false} onPress={() => void pick(m.id)} />
+              <Chip key={m.id} label={m.name} selected={false} onPress={() => { if (!loading) void pick(m.id); }} />
             ))}
           </View>
-          <Text style={[styles.muted, { marginVertical: 12 }]}>Not listed? Add yourself:</Text>
-          <Field label="Your name" value={newName} onChangeText={setNewName} />
-          <Button
-            title="Add me and join"
-            disabled={!newName.trim()}
-            onPress={() => {
-              const added = addMember(trip.id, newName, user?.id ? {
-                id: user.id, email: authEmail ?? user.email, avatarUrl: authAvatarUrl,
-              } : undefined, false);
-              void pick(added.id);
-            }}
-          />
+          {canAddSelfOnJoin ? <>
+            <Text style={[styles.muted, { marginVertical: 12 }]}>Not listed? Add yourself:</Text>
+            <Field label="Your name" value={newName} onChangeText={setNewName} />
+            <Button title="Add me and join" disabled={!newName.trim() || loading || !user} loading={loading}
+              onPress={async () => {
+                if (!user || loading) return;
+                setLoading(true);
+                setError(null);
+                try {
+                  await addSelfToTrip(trip.id, newName, { id: user.id, email: authEmail ?? user.email, avatarUrl: authAvatarUrl });
+                  router.replace(`/trip/${trip.id}`);
+                } catch (err) {
+                  setError(err instanceof Error ? err.message : "Couldn't join this trip. Try again.");
+                } finally { setLoading(false); }
+              }} />
+          </> : <Text style={[styles.muted, { marginTop: 12 }]}>
+            Not listed? Ask the trip owner to add your name, then select it here.
+          </Text>}
         </Card>
       )}
+      {error && <Text style={{ color: colors.negative, marginTop: 10 }}>{error}</Text>}
     </ScrollView>
   );
 }

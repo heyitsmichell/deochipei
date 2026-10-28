@@ -5,7 +5,8 @@ import {
   type NetBalance,
   type SettlementOptimizer,
 } from "./settlement";
-import { computeShares } from "./split";
+import { computeShares, shareWeights } from "./split";
+import { isISODate } from "./receiptScan";
 import type { Expense, Trip } from "./types";
 
 export interface Balance {
@@ -99,7 +100,7 @@ export class Ledger {
       throw new Error(`Invalid expense ${e.id}`);
     }
     const total = toMinor(baseAmount(e), this.currency);
-    const weights = new Map(Object.entries(computeShares(e)));
+    const weights = shareWeights(computeShares(e));
     // Split the rounded total itself, so the shares always add up to what was paid.
     const shares = weights.size ? allocate(total, weights) : new Map([[e.paidBy, total]]);
 
@@ -165,4 +166,19 @@ export class Ledger {
     to: t.to,
     amount: this.major(t.minor),
   });
+}
+
+/** Keep a broken historical record visible for repair without publishing partial totals. */
+export function inspectLedger(trip: Trip): { ledger?: Ledger; invalid: Expense[] } {
+  const invalid = trip.expenses.filter((expense) => {
+    try {
+      if (!isISODate(expense.date) || typeof expense.description !== "string" || !expense.paidBy ||
+          !/^[A-Z]{3}$/.test(expense.currency) || !Array.isArray(expense.split?.memberIds)) return true;
+      new Ledger({ ...trip, expenses: [expense] });
+      return false;
+    } catch { return true; }
+  });
+  if (invalid.length) return { invalid };
+  try { return { ledger: new Ledger(trip), invalid }; }
+  catch { return { invalid: trip.expenses }; }
 }

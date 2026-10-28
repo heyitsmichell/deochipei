@@ -49,7 +49,9 @@ function allocateItemShares(
     } else {
       const shift = i % owners.length;
       const rotated = [...owners.slice(shift), ...owners.slice(0, shift)];
-      alloc = allocate(itemMinor, new Map(rotated.map((id) => [id, 1])));
+      alloc = new Map([...allocate(Math.abs(itemMinor), new Map(rotated.map((id) => [id, 1])))].map(
+        ([id, share]) => [id, itemMinor < 0 ? -share : share],
+      ));
     }
 
     for (const [id, minor] of alloc) {
@@ -155,7 +157,7 @@ export function computeItemizedBreakdown(
   );
 
   const totalBaseMinor = toMinor(expense.amount * rate, expense.baseCurrency);
-  const activeWeights = new Map(Object.entries(shares));
+  const activeWeights = shareWeights(shares);
   const baseAllocated = allocate(totalBaseMinor, activeWeights);
 
   return people.map((id) => {
@@ -189,4 +191,12 @@ export function computeItemizedBreakdown(
       totalShareBase,
     };
   });
+}
+
+/** Zero shares remain visible in the UI, but are not allocator weights. */
+export function shareWeights(shares: Record<string, number>): Map<string, number> {
+  const entries = Object.entries(shares);
+  const positive = entries.filter(([, value]) => value > 0);
+  // A tiny source amount may round to zero before conversion to the base currency.
+  return new Map(positive.length ? positive : entries.map(([id]) => [id, 1]));
 }

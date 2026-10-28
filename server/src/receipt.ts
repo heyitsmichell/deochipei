@@ -38,7 +38,7 @@ export const ReceiptSchema = z.object({
     z.object({
       name: z.string().describe("Line item text exactly as printed"),
       translated_name: nullableText.describe("Line item in the target language"),
-      quantity: modelNumber.default(1),
+      quantity: z.preprocess((value) => value == null || value === "" ? 1 : value, z.coerce.number().finite().positive()),
       total_price: modelNumber.describe("Line total for this item"),
     }),
   ).max(200),

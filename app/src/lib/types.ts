@@ -87,6 +87,21 @@ export interface Trip {
   inviteExpiresAt?: number | string | null;
 }
 
+/** An invite lookup exposes names only and must never replace an account's full trip. */
+export interface TripPreview {
+  preview: true;
+  id: string;
+  code?: string;
+  name: string;
+  baseCurrency: string;
+  members: Member[];
+  inviteExpiresAt?: number | string | null;
+}
+export type TripLookup = Trip | TripPreview;
+export function isTripPreview(trip: TripLookup): trip is TripPreview {
+  return "preview" in trip && trip.preview === true;
+}
+
 export interface ReceiptScan {
   merchant: string | null;
   merchant_translated: string | null;

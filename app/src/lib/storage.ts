@@ -31,12 +31,14 @@ export class CoalescedWriter {
   private saving?: Promise<void>;
   private unsaved = false;
   private failed = false;
+  private lastError: unknown;
 
   constructor(
     private readonly storage: KeyValueStorage,
     private readonly key: string,
     private readonly current: () => unknown,
     private readonly onError?: (error: unknown) => void,
+    private readonly onSaved?: () => void,
   ) {}
 
   /** Marks the value changed; it's written shortly. */
@@ -47,6 +49,7 @@ export class CoalescedWriter {
       const run = this.writeUntilSaved().catch((error) => {
         this.unsaved = true;
         this.failed = true;
+        this.lastError = error;
         this.onError?.(error);
         throw error;
       });
@@ -61,13 +64,15 @@ export class CoalescedWriter {
   }
 
   /** Resolves once every change so far has been written. */
-  saved = () => this.saving ?? Promise.resolve();
+  saved = () => this.saving ?? (this.failed ? Promise.reject(this.lastError) : Promise.resolve());
 
   private async writeUntilSaved() {
     await Promise.resolve(); // Let the rest of this change land first.
     while (this.unsaved) {
       this.unsaved = false;
-      await this.storage.setItem(this.key, JSON.stringify(this.current())).catch(() => {});
+      await this.storage.setItem(this.key, JSON.stringify(this.current()));
+      this.lastError = undefined;
+      this.onSaved?.();
     }
   }
 }

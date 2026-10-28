@@ -51,7 +51,7 @@ function toTrip(row: Record<string, any>): Trip {
 /** RPCs may return the row directly, a one-element array, or { trip: row }. */
 export function normalizeTripResponse(value: unknown): Trip {
   const row = Array.isArray(value) ? value[0] : (value as any)?.trip ?? value;
-  if (!row || typeof row !== "object") throw new ApiError("Invalid trip response", 502);
+  if (!row || typeof row !== "object") throw new ApiError("Invalid trip response", 502, false);
   return toTrip(row as Record<string, any>);
 }
 
@@ -63,7 +63,7 @@ function toTimestamp(value: unknown): number {
     const parsed = Date.parse(value);
     if (Number.isFinite(parsed)) return parsed;
   }
-  throw new ApiError("Invalid server timestamp", 502);
+  throw new ApiError("Invalid server timestamp", 502, false);
 }
 
 export function joinTripRpcArgs(code: string, claimMemberId: string | null) {
@@ -85,7 +85,7 @@ function toExpense(row: Record<string, any>): Expense {
   const amount = Number(row.amount);
   const rateToBase = Number(row.rate_to_base ?? row.rateToBase);
   if (!Number.isFinite(amount) || amount <= 0 || !Number.isFinite(rateToBase) || rateToBase <= 0) {
-    throw new ApiError("Invalid expense data", 502);
+    throw new ApiError("Invalid expense data", 502, false);
   }
   return {
     id: row.id,
@@ -113,6 +113,14 @@ function toExpense(row: Record<string, any>): Expense {
 
 export const supabaseData = {
   enabled: directModeEnabled,
+  async listTrips(): Promise<Trip[]> {
+    return withDirectSupabase(async () => {
+      // RLS restricts this list to trips the authenticated account can read.
+      const { data, error } = await supabase.from("trips").select("*, trip_members(*), expenses(*)");
+      if (error) throw new ApiError(error.message, supabaseErrorStatus(error.code));
+      return (data ?? []).map(toTrip);
+    }, async () => { throw new ApiError("Trip sync is unavailable", 503); });
+  },
   async getTrip(id: string, knownVersion?: number): Promise<Trip | null> {
     return withDirectSupabase(async () => {
       const { data, error } = await supabase

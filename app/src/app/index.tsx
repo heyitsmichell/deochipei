@@ -2,9 +2,9 @@ import { router } from "expo-router";
 import { memo, useMemo } from "react";
 import { ActivityIndicator, FlatList, Pressable, Text, View } from "react-native";
 import { Button, Card, useTheme } from "../components/ui";
-import { baseAmount } from "../lib/ledger";
+import { inspectLedger } from "../lib/ledger";
 import type { Trip } from "../lib/types";
-import { useOnline, useQueuedCount, useReady, useTripList } from "../state/TripsContext";
+import { useOnline, useQueuedCount, useReady, useSyncError, useTripActions, useTripList, useUnverifiedCount } from "../state/TripsContext";
 import { useHomeCurrency } from "../state/useHomeCurrency";
 
 export default function TripsScreen() {
@@ -12,6 +12,9 @@ export default function TripsScreen() {
   const ready = useReady();
   const trips = useTripList();
   const online = useOnline();
+  const unverified = useUnverifiedCount();
+  const accountError = useSyncError("__account__");
+  const { retryAccountRestore } = useTripActions();
 
   if (!ready) {
     return (
@@ -32,6 +35,13 @@ export default function TripsScreen() {
           <Text style={styles.muted}>
             Snap receipts in any language, split costs, settle up in your own currency.
           </Text>
+          {unverified > 0 && <Text style={{ color: colors.warning, marginTop: 8 }}>
+            Offline work is saved for trips that need account verification. Sign in to their account or join those trips again to recover it.
+          </Text>}
+          {accountError && <View style={{ marginTop: 8 }}>
+            <Text style={{ color: colors.warning }}>{accountError}</Text>
+            <Button title="Retry loading trips" variant="secondary" onPress={() => void retryAccountRestore()} />
+          </View>}
           {!online && (
             <Text style={{ color: colors.warning, marginTop: 8 }}>
               Offline — changes will sync when you reconnect. Receipts you snap are read once you&apos;re on Wi-Fi.
@@ -80,17 +90,18 @@ const TripCard = memo(function TripCard({ trip }: { trip: Trip }) {
   const { colors, styles } = useTheme();
   const queued = useQueuedCount(trip.id);
   const { view } = useHomeCurrency(trip);
-  const spent = useMemo(() => trip.expenses.reduce((sum, e) => sum + baseAmount(e), 0), [trip.expenses]);
-  const total = view.format(spent);
+  const ledger = useMemo(() => inspectLedger(trip).ledger, [trip]);
+  const spent = ledger?.totalSpent;
+  const total = view.format(spent ?? 0);
   return (
     <Pressable onPress={() => router.push(`/trip/${trip.id}`)}>
       <Card>
         <Text style={styles.h2}>{trip.name}</Text>
         <Text style={styles.muted}>{trip.members.map((m) => m.name).join(", ")}</Text>
         <Text style={{ marginTop: 8, fontWeight: "600", color: colors.text }}>
-          {total.main} · {trip.expenses.length} expenses
+          {ledger ? total.main : "Needs correction"} · {trip.expenses.length} expenses
         </Text>
-        {total.original && <Text style={[styles.muted, { fontSize: 13 }]}>{total.original}</Text>}
+        {ledger && total.original && <Text style={[styles.muted, { fontSize: 13 }]}>{total.original}</Text>}
         {queued > 0 && (
           <Text style={{ color: colors.warning, marginTop: 4 }}>
             🧾 {queued} receipt{queued === 1 ? "" : "s"} waiting to be read

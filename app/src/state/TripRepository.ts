@@ -2,13 +2,13 @@ import type { api as defaultApi } from "../lib/api";
 import { ApiError } from "../lib/errors";
 import { isInviteExpired } from "../lib/invite";
 import { CoalescedWriter, type KeyValueStorage } from "../lib/storage";
-import { newId, type Expense, type Member, type ThemePreference, type Trip } from "../lib/types";
+import { isTripPreview, newId, type TripLookup, type Expense, type Member, type ThemePreference, type Trip } from "../lib/types";
 
 export type TripApi = typeof defaultApi;
 export type TripPatch = Partial<Pick<Trip, "name" | "baseCurrency">>;
 
 /** A change made on this device that the server hasn't confirmed yet. */
-type OpMeta = { attempts?: number; retryAt?: number };
+type OpMeta = { attempts?: number; retryAt?: number; recovered?: boolean };
 export type Op =
   | ({ kind: "createTrip"; tripId: string } & OpMeta)
   | ({ kind: "patchTrip"; tripId: string; patch: TripPatch } & OpMeta)
@@ -26,6 +26,9 @@ export interface Settings {
 }
 
 export interface PersistedData {
+  accountId?: string | null;
+  /** Legacy offline work whose account could not be established; never synced automatically. */
+  unverified?: { trips: Record<string, Trip>; ops: Op[]; failedOps: Op[]; me: Record<string, string> };
   trips: Record<string, Trip>;
   ops: Op[];
   /** Operations rejected permanently; retained for diagnostics without blocking later work. */
@@ -94,6 +97,105 @@ export class TripRepository {
   private flushAgain = false;
   private readonly refreshing = new Map<string, Promise<void>>();
   private persistenceUnavailable = false;
+  private accountId: string | null = null;
+  private epoch = 0;
+  private accountRequest = 0;
+  private accountTransition: Promise<void> = Promise.resolve();
+  private accountRestoreNeeded = false;
+  private restoring?: Promise<void>;
+  private readonly previews = new Map<string, TripLookup>();
+
+  canSync = () => this.accountId !== null;
+
+  /** Resolve authentication before sending persisted operations, and isolate account changes. */
+  setAccount = (id: string | null, beforeReset: (mode?: "reset" | "migrate") => Promise<void> = async () => {}) => {
+    const request = ++this.accountRequest;
+    this.accountId = null;
+    ++this.epoch;
+    this.previews.clear();
+    this.restoring = undefined;
+    const transition = this.accountTransition.catch(() => {}).then(async () => {
+      await this.ready();
+      if (request !== this.accountRequest) return;
+      const cachedAccount = this.data.accountId;
+      if (cachedAccount === undefined) {
+        // Keep verifiable trips active. Retain uncertain legacy work separately
+        // until the server confirms access, without sending it as another user.
+        const uncertain = new Set(Object.values(this.data.trips).filter((trip) => trip.syncEnabled &&
+          (!id || (trip.ownerId !== id && !trip.members.some((member) => member.userId === id)))).map((trip) => trip.id));
+        if (uncertain.size) {
+          this.update((data) => ({ ...data,
+            unverified: {
+              trips: { ...data.unverified?.trips, ...Object.fromEntries(Object.entries(data.trips).filter(([tripId]) => uncertain.has(tripId))) },
+              ops: [...(data.unverified?.ops ?? []), ...data.ops.filter((op) => uncertain.has(op.tripId))],
+              failedOps: [...(data.unverified?.failedOps ?? []), ...data.failedOps.filter((op) => uncertain.has(op.tripId))],
+              me: { ...data.unverified?.me, ...Object.fromEntries(Object.entries(data.me).filter(([tripId]) => uncertain.has(tripId))) },
+            },
+            trips: Object.fromEntries(Object.entries(data.trips).filter(([tripId]) => !uncertain.has(tripId))),
+            ops: data.ops.filter((op) => !uncertain.has(op.tripId)),
+            failedOps: data.failedOps.filter((op) => !uncertain.has(op.tripId)),
+            me: Object.fromEntries(Object.entries(data.me).filter(([tripId]) => !uncertain.has(tripId))),
+          }));
+          await beforeReset("migrate");
+        }
+      } else if (cachedAccount !== id) {
+        let cleanupError: unknown;
+        try { await beforeReset("reset"); }
+        catch (error) { cleanupError = error; }
+        if (request !== this.accountRequest) return;
+        await this.resetForAccount();
+        if (cleanupError) throw cleanupError;
+      }
+      if (request !== this.accountRequest) return;
+      this.update((data) => ({ ...data, accountId: id }));
+      this.accountId = id;
+      this.accountRestoreNeeded = !!id;
+    });
+    this.accountTransition = transition;
+    return transition.then(async () => {
+      if (request !== this.accountRequest) return;
+      await this.restoreAccount();
+      await this.flush();
+    });
+  };
+
+  restoreAccount = (): Promise<void> => {
+    if (!this.accountId || !this.accountRestoreNeeded) return Promise.resolve();
+    if (this.restoring) return this.restoring;
+    const epoch = this.epoch;
+    const id = this.accountId;
+    const run = (async () => {
+      try {
+        const trips = await this.api.listTrips();
+        if (epoch !== this.epoch) return;
+        for (const trip of trips) {
+          this.adopt(trip, { allowNew: true });
+          const member = trip.members.find((candidate) => candidate.userId === id);
+          if (member) this.setMe(trip.id, member.id);
+        }
+        this.accountRestoreNeeded = false;
+        this.setSyncError("__account__", undefined);
+        this.setOnline(true);
+      } catch (error) {
+        if (epoch !== this.epoch) return;
+        if (error instanceof ApiError && !error.isRetryable) {
+          this.accountRestoreNeeded = false;
+          this.setOnline(true);
+          this.setSyncError("__account__", "Couldn't load your account trips. Try again.");
+        } else {
+          this.setOnline(false);
+          // Keep same-account offline data and retry on reconnect.
+        }
+      }
+    })();
+    this.restoring = run;
+    return run.finally(() => { if (this.restoring === run) this.restoring = undefined; });
+  };
+  retryAccountRestore = () => {
+    this.accountRestoreNeeded = !!this.accountId;
+    return this.restoreAccount();
+  };
+
   private retryTimer?: ReturnType<typeof setInterval>;
   private readonly writer: CoalescedWriter;
 
@@ -106,9 +208,13 @@ export class TripRepository {
     this.writer = new CoalescedWriter(storage, storageKey, () => this.data, () => {
       // A write failure can be retried on the next change; a read failure is
       // kept disabled so a later save cannot overwrite unknown stored data.
-      this.persistenceUnavailable = false;
       this.snapshot = { ...this.snapshot, storageError: true };
       this.emit();
+    }, () => {
+      if (this.snapshot.storageError && !this.persistenceUnavailable) {
+        this.snapshot = { ...this.snapshot, storageError: false };
+        this.emit();
+      }
     });
   }
 
@@ -128,7 +234,7 @@ export class TripRepository {
 
   /** Resolves once every change so far has been written to storage. */
   saved = async () => {
-    if (this.persistenceUnavailable || this.snapshot.storageError) {
+    if (this.persistenceUnavailable) {
       throw new Error("Local storage is unavailable.");
     }
     await this.writer.saved();
@@ -139,6 +245,7 @@ export class TripRepository {
   start() {
     this.starting ??= this.ready().then(() => this.flush());
     this.retryTimer ??= setInterval(() => {
+      if (this.accountRestoreNeeded) void this.restoreAccount();
       if (this.data.ops.length) this.flush();
     }, this.retryMs);
     return this.starting;
@@ -159,6 +266,8 @@ export class TripRepository {
 
   meFor = (tripId: string): string | undefined => this.data.me[tripId];
 
+  hasUnverifiedTrip = (tripId: string) => !!this.data.unverified?.trips[tripId];
+
   pendingCount = (tripId: string) => this.data.ops.filter((o) => o.tripId === tripId).length;
   failedCount = (tripId: string) => this.data.failedOps.filter((o) => o.tripId === tripId).length;
 
@@ -168,15 +277,25 @@ export class TripRepository {
     this.update((d) => ({
       ...d,
       failedOps: d.failedOps.filter((op) => op.tripId !== tripId),
-      ops: [...d.ops, ...failed.map(({ attempts: _attempts, retryAt: _retryAt, ...op }) => op as Op)],
+      ops: [...d.ops, ...failed.map(({ attempts: _attempts, retryAt: _retryAt, recovered: _recovered, ...op }) => op as Op)],
     }));
     this.flush();
   };
 
   discardFailed = async (tripId: string) => {
     if (!this.data.failedOps.some((op) => op.tripId === tripId)) return;
-    this.update((d) => ({ ...d, failedOps: d.failedOps.filter((op) => op.tripId !== tripId) }));
-    await this.refresh(tripId);
+    const rejected = this.data.failedOps.filter((op) => op.tripId === tripId);
+    const epoch = this.epoch;
+    await this.flush();
+    const server = await this.api.getTrip(tripId); // An optimistic copy's revision cannot validate its contents.
+    if (epoch !== this.epoch) return;
+    if (!server) throw new ApiError("Could not reload the trip. Your rejected changes are still available.", 503);
+    const local = this.data.trips[tripId];
+    if (local?.revision != null && server.revision != null && server.revision < local.revision) {
+      throw new ApiError("The server returned an older trip. Try again shortly.", 503);
+    }
+    this.update((d) => ({ ...d, failedOps: d.failedOps.filter((op) => !rejected.includes(op)) }));
+    this.adopt(server);
   };
 
   // ── Commands ────────────────────────────────────────────────────────────
@@ -225,12 +344,17 @@ export class TripRepository {
 
   claimTripMember = async (tripId: string, memberId: string, user?: { id?: string; email?: string; avatarUrl?: string }) => {
     await this.ready();
-    const trip = this.data.trips[tripId];
-    if (!trip?.members.some((m) => m.id === memberId)) throw new ApiError("Trip member not found", 404);
-    if (trip.syncEnabled && user?.id) {
-      const member = trip.members.find((m) => m.id === memberId)!;
-      const updated = await this.api.claimMember(trip.code ?? trip.inviteCode ?? "", memberId, member);
-      this.adopt(updated);
+    const trip = this.previews.get(tripId) ?? this.data.trips[tripId];
+    const epoch = this.epoch;
+    const member = trip?.members.find((candidate) => candidate.id === memberId);
+    if (!trip || !member) throw new ApiError("Trip member not found", 404);
+    if ((isTripPreview(trip) || trip.syncEnabled) && user?.id && (isTripPreview(trip) || member.userId !== user.id)) {
+      const code = trip.code ?? (!isTripPreview(trip) ? trip.inviteCode : undefined);
+      if (!code) throw new ApiError("This trip has no invite code yet. Try again once it has synced.", 409);
+      const updated = await this.api.claimMember(code, memberId, member);
+      if (epoch !== this.epoch) return;
+      this.adopt(updated, { allowNew: true });
+      this.previews.delete(tripId);
     }
     this.setMe(tripId, memberId, user);
   };
@@ -238,13 +362,19 @@ export class TripRepository {
   joinTrip = async (
     code: string,
     user?: { id?: string; email?: string; displayName?: string; name?: string; avatarUrl?: string },
-  ): Promise<Trip> => {
+  ): Promise<TripLookup> => {
     // A deep link can open the app straight into joining; don't let the
     // initial load overwrite the trip we're about to add.
     await this.ready();
+    const epoch = this.epoch;
     const trip = await this.api.joinTrip(code, user);
+    if (epoch !== this.epoch) throw new ApiError("Account changed. Look up the trip again.", 409);
     if (isInviteExpired(trip.inviteExpiresAt)) {
       throw new ApiError("This invite code has expired.", 410);
+    }
+    if (isTripPreview(trip)) {
+      this.previews.set(trip.id, trip);
+      return trip;
     }
     let resolvedTrip = trip;
     if (user?.id) {
@@ -272,6 +402,20 @@ export class TripRepository {
     return resolvedTrip;
   };
 
+  addSelfToTrip = async (tripId: string, name: string, user: { id: string; email?: string; avatarUrl?: string }) => {
+    const trip = this.previews.get(tripId) ?? this.data.trips[tripId];
+    if (!trip || !name.trim()) throw new ApiError("Enter your name and look up the trip again.", 400);
+    const epoch = this.epoch;
+    const member: Member = { id: newId(), name: name.trim().slice(0, 60), userId: user.id, email: user.email, avatarUrl: user.avatarUrl };
+    const code = trip.code ?? (!isTripPreview(trip) ? trip.inviteCode : undefined);
+    if (!code) throw new ApiError("This trip has no invite code yet. Try again once it has synced.", 409);
+    const updated = await this.api.claimMember(code, member.id, member);
+    if (epoch !== this.epoch) return;
+    this.adopt(updated, { allowNew: true });
+    this.previews.delete(tripId);
+    this.setMe(tripId, member.id, user);
+  };
+
   regenerateTripInvite = async (tripId: string): Promise<Trip> => {
     await this.ready();
     const existing = this.data.trips[tripId];
@@ -293,15 +437,11 @@ export class TripRepository {
   };
 
   setMe = (tripId: string, memberId: string, user?: { id?: string; email?: string; avatarUrl?: string }) => {
-    if (user?.id) {
-      const current = this.member(tripId, memberId);
-      if (current?.userId && current.userId !== user.id) return;
-      if (current && (current.userId !== user.id || current.email !== user.email || current.avatarUrl !== user.avatarUrl)) {
-        if (this.data.trips[tripId]?.syncEnabled) this.enqueue({ kind: "upsertMember", tripId, member: {
-          ...current, userId: user.id, email: user.email, avatarUrl: user.avatarUrl,
-        } });
-      }
-    }
+    const trip = this.data.trips[tripId];
+    const current = this.member(tripId, memberId);
+    if (!current) return;
+    // A synced identity is bound only by the authenticated claim endpoint.
+    if (trip?.syncEnabled && user?.id && current.userId !== user.id) return;
     this.update((d) => ({ ...d, me: { ...d.me, [tripId]: memberId } }));
     // Picking yourself on a new phone brings along the currency you chose elsewhere.
     const chosen = this.member(tripId, memberId)?.homeCurrency;
@@ -376,18 +516,22 @@ export class TripRepository {
 
   /** Push queued changes, then pull the latest copy of the trip if it has changed. */
   refresh = (tripId: string): Promise<void> => {
-    if (!this.data.trips[tripId]?.syncEnabled) return Promise.resolve();
+    if (!this.canSync() || !this.data.trips[tripId]?.syncEnabled) return Promise.resolve();
     const ongoing = this.refreshing.get(tripId);
     if (ongoing) return ongoing;
+    const epoch = this.epoch;
     const run = (async () => {
       await this.flush();
+      if (epoch !== this.epoch) return;
       try {
         const local = this.data.trips[tripId];
         const server = await this.api.getTrip(tripId, local?.revision);
+        if (epoch !== this.epoch) return;
         if (server) this.adopt(server);
         this.setOnline(true);
         this.setSyncError(tripId, undefined);
       } catch (err) {
+        if (epoch !== this.epoch) return;
         if (err instanceof ApiError && !err.isRetryable) {
           this.setOnline(true);
           const message = err.status === 403 || err.status === 404
@@ -487,15 +631,18 @@ export class TripRepository {
   }
 
   private async drainQueue() {
-    while (this.data.ops.length) {
+    const epoch = this.epoch;
+    while (this.canSync() && epoch === this.epoch && this.data.ops.length) {
       const op = this.data.ops[0];
       if ((op.retryAt ?? 0) > Date.now()) return;
       try {
         const server = await this.send(op);
+        if (epoch !== this.epoch) return;
         this.dropOp(op);
         this.adopt(server);
         this.setOnline(true);
       } catch (err) {
+        if (epoch !== this.epoch) return;
         if (err instanceof ApiError && err.isPermanent) {
           console.warn("Parking rejected op", op.kind, err.message);
           this.parkOp(op);
@@ -564,29 +711,32 @@ export class TripRepository {
   /** Take the server's copy, then replay this device's unsent ops on top. */
   private adopt(server: Trip, { allowNew = false } = {}) {
     this.update((d) => {
+      const archive = d.unverified;
+      if (archive?.trips[server.id] && this.accountId && (server.ownerId === this.accountId ||
+          server.members.some((member) => member.userId === this.accountId))) {
+        const { [server.id]: _trip, ...remainingTrips } = archive.trips;
+        const { [server.id]: _me, ...remainingMe } = archive.me;
+        d = { ...d,
+          failedOps: [...d.failedOps, ...[...archive.failedOps, ...archive.ops]
+            .filter((op) => op.tripId === server.id).map((op) => ({ ...op, recovered: true }))],
+          unverified: { trips: remainingTrips, me: remainingMe,
+            ops: archive.ops.filter((op) => op.tripId !== server.id),
+            failedOps: archive.failedOps.filter((op) => op.tripId !== server.id) },
+        };
+      }
       const local = d.trips[server.id];
       // Ignore late responses for trips removed from this device.
       if (!local && !allowNew) return d;
       const pending = [
-        ...d.ops.filter((o) => o.tripId === server.id),
         ...d.failedOps.filter((o) => o.tripId === server.id),
+        ...d.ops.filter((o) => o.tripId === server.id),
       ];
       // Compare server-owned revisions when available; device timestamps are
       // not comparable across clocks. Keep the timestamp fallback for older
       // server copies that predate revisions.
-      if (local && !pending.length) {
+      if (local) {
         if (server.revision != null && local.revision != null && server.revision < local.revision) return d;
         if (server.revision == null && local.revision == null && server.updatedAt < local.updatedAt) return d;
-      }
-      // Polling usually returns what we already have: skip the re-render and disk write.
-      if (
-        local &&
-        !pending.length &&
-        ((server.revision != null && local.revision != null && server.revision === local.revision) ||
-          (server.revision == null && local.revision == null && local.updatedAt === server.updatedAt)) &&
-        local.code === server.code
-      ) {
-        return d;
       }
       const merged = pending.reduce(applyOp, {
         ...server,
@@ -625,6 +775,7 @@ export class TripRepository {
   }
 
   resetForAccount = async () => {
+    await this.ready();
     const keepTrip = (trip: Trip) => !trip.syncEnabled;
     const trips = Object.fromEntries(Object.entries(this.data.trips).filter(([, trip]) => keepTrip(trip)));
     const guestIds = new Set(Object.keys(trips));
@@ -637,11 +788,13 @@ export class TripRepository {
         failedOps: this.data.failedOps.filter((op) => guestIds.has(op.tripId)),
         me: Object.fromEntries(Object.entries(this.data.me).filter(([tripId]) => guestIds.has(tripId))),
         settings: this.data.settings,
+        unverified: this.data.unverified,
       },
       ready: true,
     };
-    this.persistenceUnavailable = false;
-    this.snapshot = { ...this.snapshot, storageError: false };
+    this.snapshot = { ...this.snapshot, syncErrors: {} };
+    this.emit();
+    if (this.persistenceUnavailable) throw new Error("Local storage is unavailable.");
     this.writer.save();
     await this.writer.saved();
     await this.storage.removeItem?.(`${this.storageKey}:backup`).catch(() => {});

@@ -2,6 +2,7 @@ import { Stack, ThemeProvider as NavigationThemeProvider } from "expo-router";
 import { StatusBar } from "expo-status-bar";
 import type { ReactNode } from "react";
 import { ThemeProvider, useTheme } from "../components/theme";
+import { AlertHost } from "../components/AlertHost";
 import { AuthProvider } from "../context/AuthContext";
 import { TripsProvider, useSettings } from "../state/TripsContext";
 
@@ -15,6 +16,7 @@ export default function RootLayout() {
       <TripsProvider>
         <AppThemeProvider>
           <RootStack />
+          <AlertHost />
         </AppThemeProvider>
       </TripsProvider>
     </AuthProvider>

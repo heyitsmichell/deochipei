@@ -1,7 +1,9 @@
+import { Alert } from "../lib/alert";
 import { router } from "expo-router";
 import { useState } from "react";
-import { Alert, ScrollView, Text, View } from "react-native";
+import { ScrollView, Text, View } from "react-native";
 import { Button, CurrencyPicker, Field, Label, useTheme } from "../components/ui";
+import { canAddSelfOnJoin } from "../lib/api";
 import { useAuth } from "../context/AuthContext";
 import { useSettings, useTripActions } from "../state/TripsContext";
 
@@ -58,7 +60,7 @@ export default function NewTripScreen() {
         onChangeText={setOthers}
       />
       <Text style={[styles.muted, { marginBottom: 16 }]}>
-        Others can also join later with the trip code and add themselves.
+        {canAddSelfOnJoin ? "Others can also join later with the trip code and add themselves." : "Add everyone’s name here so they can claim it later with the trip code."}
       </Text>
       <Button title="Create trip" onPress={submit} />
     </ScrollView>

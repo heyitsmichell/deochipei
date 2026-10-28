@@ -3,7 +3,7 @@ import type { DuplicateCheckRequest, DuplicateVerdict } from "./duplicates";
 import { ApiError } from "./errors";
 import { supabaseData } from "./supabaseData";
 import { supabase } from "./supabase";
-import type { Expense, Member, ReceiptScan, Trip } from "./types";
+import type { Expense, Member, ReceiptScan, Trip, TripLookup } from "./types";
 
 const API_PORT = 4000;
 
@@ -67,6 +67,7 @@ async function request<T>(path: string, init?: RequestInit & { timeoutMs?: numbe
 const put = (body: unknown) => ({ method: "PUT", body: JSON.stringify(body) });
 
 const legacyApi = {
+  listTrips: () => request<Trip[]>("/api/trips"),
   createTrip: (trip: Trip) => request<Trip>("/api/trips", { method: "POST", body: JSON.stringify(trip) }),
   /**
    * The server's copy of a trip, or null if it's still at `knownVersion` (the
@@ -79,7 +80,7 @@ const legacyApi = {
       knownVersion != null ? { headers: { "if-none-match": `"${knownVersion}"` } } : undefined,
     ),
   joinTrip: (code: string, user?: { id?: string; email?: string; displayName?: string; name?: string; avatarUrl?: string }) =>
-    request<Trip>(`/api/join/${encodeURIComponent(code.trim())}`, {
+    request<TripLookup>(`/api/join/${encodeURIComponent(code.trim())}`, {
       method: "POST",
       body: user ? JSON.stringify(user) : undefined,
     }),
@@ -112,8 +113,11 @@ const legacyApi = {
 const useDirectSupabase =
   Boolean(process.env.EXPO_PUBLIC_SUPABASE_DATA_MODE === "direct") && Boolean(supabaseData.enabled);
 
+export const canAddSelfOnJoin = !useDirectSupabase;
+
 export const api = useDirectSupabase
   ? {
+      listTrips: supabaseData.listTrips,
       createTrip: supabaseData.createTrip,
       getTrip: supabaseData.getTrip,
       joinTrip: supabaseData.joinTrip,

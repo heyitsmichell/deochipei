@@ -1,5 +1,6 @@
+import { Alert } from "../lib/alert";
 import { router } from "expo-router";
-import { ActivityIndicator, Alert, Image, Pressable, Text, View } from "react-native";
+import { ActivityIndicator, Image, Pressable, Text, View } from "react-native";
 import { formatMoney } from "../lib/money";
 import type { NetworkStatus } from "../lib/network";
 import {
@@ -27,7 +28,7 @@ export function PendingReceipts({ tripId }: { tripId: string }) {
   const discard = (r: QueuedReceipt) =>
     Alert.alert("Discard this receipt?", "The photo will be deleted from this phone.", [
       { text: "Cancel", style: "cancel" },
-      { text: "Discard", style: "destructive", onPress: () => discardReceipt(r.id) },
+      { text: "Discard", style: "destructive", onPress: () => void discardReceipt(r.id).catch((error) => Alert.alert("Couldn’t discard receipt", String(error))) },
     ]);
 
   return (
@@ -118,7 +119,7 @@ function DuplicateNote({ receipt: r, tripId }: { receipt: QueuedReceipt; tripId:
       )}
       {!!r.duplicate?.reason && <Text style={[styles.muted, { fontSize: 13, marginTop: 2 }]}>{r.duplicate.reason}</Text>}
       <View style={{ flexDirection: "row", gap: 16, marginTop: 6 }}>
-        <Link title="Discard copy" onPress={() => discardReceipt(r.id)} />
+        <Link title="Discard copy" onPress={() => void discardReceipt(r.id).catch((error) => Alert.alert("Couldn’t discard receipt", String(error)))} />
         <Link title="Add anyway" onPress={addAnyway} />
       </View>
     </>
