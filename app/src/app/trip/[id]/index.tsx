@@ -15,6 +15,7 @@ import {
   useMe,
   useNetwork,
   useOnline,
+  useSyncError,
   usePendingCount,
   useFailedCount,
   useTrip,
@@ -64,6 +65,7 @@ function TripView({ trip }: { trip: Trip }) {
   const pending = usePendingCount(trip.id);
   const failed = useFailedCount(trip.id);
   const online = useOnline();
+  const syncError = useSyncError();
   const network = useNetwork();
   const [tab, setTab] = useState<Tab>("expenses");
   const [adding, setAdding] = useState(false);
@@ -114,28 +116,38 @@ function TripView({ trip }: { trip: Trip }) {
   };
 
   const confirmRemove = () =>
-    Alert.alert("Remove from this device?", "The trip stays on the server for everyone else.", [
-      { text: "Cancel", style: "cancel" },
-      {
-        text: "Remove",
-        style: "destructive",
-        onPress: () => {
-          removeTripLocally(trip.id);
-          router.back();
+    Alert.alert(
+      "Remove from this device?",
+      !trip.syncEnabled
+        ? "This guest trip exists only on this device. Removing it permanently deletes its local data."
+        : pending > 0 || failed > 0
+          ? "This removes the trip and any changes that have not reached the server yet."
+          : "The synced trip stays on the server for everyone else.",
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Remove",
+          style: "destructive",
+          onPress: () => {
+            removeTripLocally(trip.id);
+            router.back();
+          },
         },
-      },
-    ]);
+      ],
+    );
 
   const header = (
     <>
-      {(pending > 0 || failed > 0 || !online) && (
+      {(pending > 0 || failed > 0 || !online || !!syncError) && (
         <Banner>
-          {online
-            ? `Syncing ${pending} change${pending === 1 ? "" : "s"}…`
+          {syncError
+            ? syncError
             : failed
               ? `${failed} change${failed === 1 ? "" : "s"} was rejected by the server. Review it while online.`
-              : `Offline${pending ? ` — ${pending} change${pending === 1 ? "" : "s"} waiting to sync` : ""}. ` +
-              "Receipts you snap are saved and read once you're back on Wi-Fi."}
+              : online
+                ? `Syncing ${pending} change${pending === 1 ? "" : "s"}…`
+                : `Offline${pending ? ` — ${pending} change${pending === 1 ? "" : "s"} waiting to sync` : ""}. ` +
+                  "Receipts you snap are saved and read once you're back on Wi-Fi."}
         </Banner>
       )}
 

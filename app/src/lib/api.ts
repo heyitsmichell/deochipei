@@ -70,7 +70,7 @@ const legacyApi = {
   createTrip: (trip: Trip) => request<Trip>("/api/trips", { method: "POST", body: JSON.stringify(trip) }),
   /**
    * The server's copy of a trip, or null if it's still at `knownVersion` (the
-   * `updatedAt` of the copy on this phone). Polling mostly finds nothing new,
+   * server revision of the copy on this phone). Polling mostly finds nothing new,
    * so this saves downloading the whole trip every few seconds.
    */
   getTrip: (id: string, knownVersion?: number) =>
@@ -83,8 +83,8 @@ const legacyApi = {
       method: "POST",
       body: user ? JSON.stringify(user) : undefined,
     }),
-  claimMember: (code: string, memberId: string) => request<Trip>(`/api/join/${encodeURIComponent(code.trim())}`, {
-    method: "POST", body: JSON.stringify({ claimMemberId: memberId }),
+  claimMember: (code: string, memberId: string, member?: Member) => request<Trip>(`/api/join/${encodeURIComponent(code.trim())}`, {
+    method: "POST", body: JSON.stringify({ claimMemberId: memberId, ...(member ? { member } : {}) }),
   }),
   regenerateTripInvite: (tripId: string) =>
     request<Trip>(`/api/trips/${tripId}/regenerate-invite`, { method: "POST" }),

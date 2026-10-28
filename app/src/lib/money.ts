@@ -43,10 +43,14 @@ export const CURRENCIES: { code: string; name: string }[] = [
   { code: "KES", name: "Kenyan Shilling" },
 ];
 
-const ZERO_DECIMAL = new Set(["JPY", "KRW", "VND", "CLP", "ISK"]);
+const ZERO_DECIMAL = new Set([
+  "BIF", "CLP", "DJF", "GNF", "ISK", "JPY", "KMF", "KRW", "PYG", "RWF", "UGX", "VND", "VUV", "XAF", "XOF", "XPF",
+]);
+const THREE_DECIMAL = new Set(["BHD", "IQD", "JOD", "KWD", "LYD", "OMR", "TND"]);
 
 export function fractionDigits(code?: string) {
-  return code && ZERO_DECIMAL.has(code.toUpperCase()) ? 0 : 2;
+  const normalized = code?.toUpperCase();
+  return normalized && THREE_DECIMAL.has(normalized) ? 3 : normalized && ZERO_DECIMAL.has(normalized) ? 0 : 2;
 }
 
 /** 12.34 USD → 1234; 500 JPY → 500. Settlement maths runs on these integers. */
@@ -106,7 +110,7 @@ export function formatMoney(amount: number, code: string) {
 }
 
 /** Accepts "1234.5", "1,234.50" and European "1.234,50". */
-export function parseAmount(text: string): number | null {
+export function parseAmount(text: string, code?: string): number | null {
   let s = text.replace(/[^\d.,-]/g, "");
   if (!s) return null;
   const lastComma = s.lastIndexOf(",");
@@ -115,9 +119,11 @@ export function parseAmount(text: string): number | null {
     // Comma is the decimal separator if it has 1-2 digits after it.
     s = /,\d{1,2}$/.test(s) ? s.replace(/\./g, "").replace(",", ".") : s.replace(/,/g, "");
   } else {
-    // A dot is unambiguously the decimal separator here. In particular,
-    // preserve three-decimal input such as 0.125 and 2.500.
-    s = s.replace(/,/g, "");
+    const zeroDecimal = fractionDigits(code) === 0;
+    // For zero-decimal currencies, a grouped value such as ¥1.500 is much
+    // more likely to mean 1,500 than 1.5. Two-decimal currencies retain
+    // three-decimal input as a decimal value and round later in toMinor().
+    s = zeroDecimal && /^-?\d{1,3}(?:\.\d{3})+$/.test(s) ? s.replace(/\./g, "") : s.replace(/,/g, "");
   }
   const n = Number(s);
   return Number.isFinite(n) ? n : null;

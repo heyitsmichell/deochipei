@@ -1,6 +1,8 @@
 import type { Session } from "@supabase/supabase-js";
 import { supabase } from "./supabase";
 
+const exchangedCodes = new Set<string>();
+
 export function extractParamsFromUrl(url: string): Record<string, string> {
   const params: Record<string, string> = {};
   if (!url) return params;
@@ -36,10 +38,23 @@ export async function handleAuthUrl(url: string): Promise<Session | null> {
 
   // This app uses PKCE; bearer tokens in arbitrary deep links are unsafe.
   if (params.code) {
+    if (exchangedCodes.has(params.code)) {
+      return (await supabase.auth.getSession()).data.session;
+    }
+    exchangedCodes.add(params.code);
     const { data, error } = await supabase.auth.exchangeCodeForSession(params.code);
-    if (error) throw error;
+    if (error) {
+      exchangedCodes.delete(params.code);
+      throw error;
+    }
+    if (exchangedCodes.size > 100) exchangedCodes.delete(exchangedCodes.values().next().value as string);
     return data.session;
   }
 
   return null;
+}
+
+export function isAuthCallbackUrl(url: string): boolean {
+  const path = url.split(/[?#]/, 1)[0].replace(/^[^:]+:\/\//, "/").replace(/\/+$/, "");
+  return path === "/auth/callback" || path.endsWith("/auth/callback");
 }

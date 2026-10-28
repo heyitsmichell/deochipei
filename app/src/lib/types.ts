@@ -22,7 +22,7 @@ export interface Member {
 
 export interface ReceiptItem {
   name: string;
-  translatedName: string;
+  translatedName: string | null;
   quantity: number;
   price: number;
 }
@@ -58,6 +58,8 @@ export interface Expense {
   // the expense was recorded (editable, since card rates differ).
   rateToBase: number;
   paidBy: string;
+  /** Server-side creator identity, retained across edits. */
+  createdBy?: string;
   date: string;
   split: Split;
   receipt?: ReceiptData;
@@ -78,6 +80,10 @@ export interface Trip {
   deletedExpenseIds: string[];
   updatedAt: number;
   ownerId?: string;
+  /** True for trips created/joined through a server; guest trips stay local. */
+  syncEnabled?: boolean;
+  /** Monotonic server revision, when the backend provides one. */
+  revision?: number;
   inviteExpiresAt?: number | string | null;
 }
 
@@ -90,7 +96,7 @@ export interface ReceiptScan {
   date: string | null;
   time: string | null;
   receipt_number: string | null;
-  items: { name: string; translated_name: string; quantity: number; total_price: number }[];
+  items: { name: string; translated_name: string | null; quantity: number; total_price: number }[];
   subtotal: number | null;
   tax: number | null;
   tip: number | null;

@@ -31,6 +31,8 @@ export interface Trip {
   deletedExpenseIds: string[];
   createdAt: number;
   updatedAt: number;
+  /** Server-owned version; unlike updatedAt it is immune to device clock skew. */
+  revision?: number;
   ownerId?: string;
   inviteExpiresAt?: number | null;
 }
@@ -63,13 +65,19 @@ export class TripStore {
   private readonly byCode = new Map<string, Trip>();
   private saving?: Promise<void>;
   private dirty = false;
+  private revision = 0;
 
   constructor(private readonly file: string) {}
 
   async load() {
     try {
       const saved = JSON.parse(await fs.readFile(this.file, "utf8")) as Trip[];
-      for (const trip of saved) this.index(trip);
+      for (const trip of saved) {
+        const revision = trip.revision;
+        if (typeof revision !== "number" || !Number.isInteger(revision) || revision <= 0) trip.revision = ++this.revision;
+        else this.revision = Math.max(this.revision, revision);
+        this.index(trip);
+      }
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
     }
@@ -109,6 +117,7 @@ export class TripStore {
       deletedExpenseIds: [],
       createdAt: now,
       updatedAt: now,
+      revision: ++this.revision,
     };
     this.index(trip);
     await this.save();
@@ -129,6 +138,7 @@ export class TripStore {
     trip.inviteCode = newCode;
     trip.inviteExpiresAt = expiresAt;
     trip.updatedAt = Math.max(Date.now(), trip.updatedAt + 1);
+    trip.revision = ++this.revision;
 
     this.byCode.set(newCode, trip);
     await this.save();
@@ -201,6 +211,7 @@ export class TripStore {
 
   upsertExpense(id: string, expense: Expense) {
     return this.mutate(id, (trip) => {
+      if (typeof expense.amount === "number" && (!Number.isFinite(expense.amount) || expense.amount <= 0)) return false;
       if (trip.deletedExpenseIds.includes(expense.id)) return false;
       const idx = trip.expenses.findIndex((e) => e.id === expense.id);
       // The server owns ordering. Client timestamps are only metadata and can
@@ -230,6 +241,7 @@ export class TripStore {
     // updatedAt is the trip's version (ETag), so it must move on every change,
     // even two in the same millisecond.
     trip.updatedAt = Math.max(Date.now(), trip.updatedAt + 1);
+    trip.revision = ++this.revision;
     await this.save();
     return trip;
   }
@@ -242,7 +254,7 @@ export class TripStore {
   private newJoinCode() {
     for (;;) {
       let code = "";
-      for (let i = 0; i < 6; i++) {
+      for (let i = 0; i < 10; i++) {
         code += CODE_ALPHABET[randomInt(0, CODE_ALPHABET.length)];
       }
       if (!this.byCode.has(code)) return code;
@@ -251,9 +263,14 @@ export class TripStore {
 
   save(): Promise<void> {
     this.dirty = true;
-    this.saving ??= this.writeUntilClean().finally(() => {
-      this.saving = undefined;
-    });
+    if (!this.saving) {
+      const run = this.writeUntilClean();
+      const wrapped = run.finally(() => {
+        if (this.saving === wrapped) this.saving = undefined;
+        if (this.dirty) this.save();
+      });
+      this.saving = wrapped;
+    }
     return this.saving;
   }
 

@@ -22,10 +22,11 @@ const receiptQueue = new ReceiptQueue({
   files: receiptFiles,
   scan: api.scanReceipt,
   rate: async (from, to) => (await rateService.getRate(from, to)).rate,
-  findDuplicate: (trip, scan, rateToBase) =>
+  findDuplicate: (trip, scan, rateToBase, excludeId) =>
     findDuplicate(api.checkDuplicate, trip, scan, {
       rateToBase,
       language: repository.getSnapshot().data.settings.receiptLanguage,
+      excludeId,
     }),
 });
 
@@ -109,6 +110,7 @@ export const useReady = () => useRepository((s) => s.ready);
 
 /** False when the last request to the sync server didn't get through. */
 export const useOnline = () => useRepository((s) => s.online);
+export const useSyncError = () => useRepository((s) => s.syncError);
 
 export const useSettings = () => useRepository((s) => s.data.settings);
 

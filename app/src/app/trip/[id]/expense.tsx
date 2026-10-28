@@ -110,7 +110,7 @@ function ExpenseEditor({ trip, expenseId, scan, queuedId }: Params & { trip: Tri
   const [duplicate, setDuplicate] = useState<DuplicateMatch | null>(null);
   const [checkingDuplicate, setCheckingDuplicate] = useState(false);
 
-  const amount = parseAmount(amountText);
+  const amount = parseAmount(amountText, currency);
   const rate = parseAmount(rateText);
 
   const loadRate = async (code: string, force = false) => {
@@ -480,11 +480,11 @@ function ExpenseEditor({ trip, expenseId, scan, queuedId }: Params & { trip: Tri
           </View>
         </Card>
       )}
-      {queued?.error && <Banner>This photo couldn&apos;t be added automatically: {queued.error}</Banner>}
+      {!!queued?.error && <Banner>This photo couldn&apos;t be added automatically: {queued.error}</Banner>}
       {existing?.needsReview && (
         <Banner tone="info">Read from a photo taken offline. Check the amount and who&apos;s splitting, then save.</Banner>
       )}
-      {receipt?.notes && <Banner>Check: {receipt.notes}</Banner>}
+      {!!receipt?.notes && <Banner>Check: {receipt.notes}</Banner>}
 
       <Field label="Description" placeholder="Dinner at Ichiran" value={description} onChangeText={setDescription} />
 
@@ -785,9 +785,9 @@ const ReceiptItems = memo(function ReceiptItems({
 
   const items = receipt?.items ?? [];
   const itemsSubtotal = items.reduce((sum, it) => sum + it.price, 0);
-  const tax = parseAmount(taxText) ?? 0;
-  const tip = parseAmount(tipText) ?? 0;
-  const fees = parseAmount(feesText) ?? 0;
+  const tax = parseAmount(taxText, currency) ?? 0;
+  const tip = parseAmount(tipText, currency) ?? 0;
+  const fees = parseAmount(feesText, currency) ?? 0;
   const calculatedTotal = fromMinor(
     toMinor(itemsSubtotal + tax + tip + fees, currency),
     currency,
@@ -800,7 +800,7 @@ const ReceiptItems = memo(function ReceiptItems({
 
   const submitAdd = () => {
     const trimmed = addTitle.trim();
-    const priceVal = parseAmount(addPrice);
+    const priceVal = parseAmount(addPrice, currency);
     if (!trimmed) {
       Alert.alert("Missing name", "Please enter an item name.");
       return;
@@ -838,7 +838,7 @@ const ReceiptItems = memo(function ReceiptItems({
   const submitEdit = () => {
     if (editingIndex == null || !items[editingIndex]) return;
     const trimmed = editTitle.trim();
-    const priceVal = parseAmount(editPrice);
+    const priceVal = parseAmount(editPrice, currency);
     if (!trimmed) {
       Alert.alert("Missing name", "Please enter an item name.");
       return;
@@ -874,7 +874,7 @@ const ReceiptItems = memo(function ReceiptItems({
         )}
       </View>
 
-      {receipt?.merchant && receipt.merchantTranslated && (
+      {!!receipt?.merchant && !!receipt.merchantTranslated && (
         <Text style={[styles.muted, { marginBottom: 8 }]}>{receipt.merchant}</Text>
       )}
 
@@ -1080,7 +1080,7 @@ const ReceiptItems = memo(function ReceiptItems({
                 const sync = isInSync();
                 onTaxChange(t);
                 if (sync) {
-                  const newTax = parseAmount(t) ?? 0;
+                  const newTax = parseAmount(t, currency) ?? 0;
                   const nextTotal = fromMinor(
                     toMinor(itemsSubtotal + newTax + tip + fees, currency),
                     currency,
@@ -1100,7 +1100,7 @@ const ReceiptItems = memo(function ReceiptItems({
                 const sync = isInSync();
                 onTipChange(t);
                 if (sync) {
-                  const newTip = parseAmount(t) ?? 0;
+                  const newTip = parseAmount(t, currency) ?? 0;
                   const nextTotal = fromMinor(
                     toMinor(itemsSubtotal + tax + newTip + fees, currency),
                     currency,
@@ -1120,7 +1120,7 @@ const ReceiptItems = memo(function ReceiptItems({
                 const sync = isInSync();
                 onFeesChange(t);
                 if (sync) {
-                  const newFees = parseAmount(t) ?? 0;
+                  const newFees = parseAmount(t, currency) ?? 0;
                   const nextTotal = fromMinor(
                     toMinor(itemsSubtotal + tax + tip + newFees, currency),
                     currency,

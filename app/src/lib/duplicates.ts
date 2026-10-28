@@ -11,6 +11,7 @@ import { todayISO, type Expense, type ReceiptScan, type Trip } from "./types";
 
 /** Body of POST /api/check-duplicate (server/src/duplicates.ts). */
 export interface DuplicateCheckRequest {
+  tripId: string;
   receipt: {
     merchant: string | null;
     merchant_translated: string | null;
@@ -68,7 +69,7 @@ export function duplicateCandidates(
   opts: { rateToBase: number | null; excludeId?: string; today?: string },
 ): Expense[] {
   const date = isISODate(scan.date) ? scan.date : (opts.today ?? todayISO());
-  const merchants = [scan.merchant, scan.merchant_translated].map(normalize).filter((m) => m.length >= 3);
+  const merchants = [scan.merchant, scan.merchant_translated].map(normalize).filter((m) => m.length >= 2);
   const number = normalize(scan.receipt_number);
 
   const scored: { expense: Expense; score: number }[] = [];
@@ -100,30 +101,39 @@ export function duplicateCheckRequest(
 ): DuplicateCheckRequest {
   const name = (id: string) => trip.members.find((m) => m.id === id)?.name ?? "Someone";
   return {
+    tripId: trip.id,
     receipt: {
-      merchant: scan.merchant,
-      merchant_translated: scan.merchant_translated,
-      date: scan.date,
-      time: scan.time ?? null,
-      receipt_number: scan.receipt_number ?? null,
-      currency: scan.currency,
+      merchant: clip(scan.merchant, 200),
+      merchant_translated: clip(scan.merchant_translated, 200),
+      date: clip(scan.date, 20),
+      time: clip(scan.time, 40),
+      receipt_number: clip(scan.receipt_number ?? null, 100),
+      currency: clip(scan.currency, 10) ?? "USD",
       total: scan.total,
-      items: scan.items.map((i) => ({ name: i.name, translated_name: i.translated_name, price: i.total_price })),
+      items: scan.items.slice(0, 200).map((i) => ({
+        name: clip(i.name, 200) ?? "Item",
+        translated_name: clip(i.translated_name, 200),
+        price: i.total_price,
+      })),
     },
     candidates: candidates.map((e) => ({
       id: e.id,
-      description: e.description || "Expense",
-      paid_by: name(e.paidBy),
-      date: e.date,
-      currency: e.currency,
+      description: clip(e.description || "Expense", 200) ?? "Expense",
+      paid_by: clip(name(e.paidBy), 80) ?? "Someone",
+      date: clip(e.date, 20) ?? todayISO(),
+      currency: clip(e.currency, 10) ?? "USD",
       amount: e.amount,
       source: e.receipt ? "scanned" : "typed",
-      merchant: e.receipt?.merchantTranslated ?? e.receipt?.merchant ?? null,
-      time: e.receipt?.time ?? null,
-      receipt_number: e.receipt?.receiptNumber ?? null,
-      items: (e.receipt?.items ?? []).map((i) => ({ name: i.name, translated_name: i.translatedName, price: i.price })),
+      merchant: clip(e.receipt?.merchantTranslated ?? e.receipt?.merchant ?? null, 200),
+      time: clip(e.receipt?.time ?? null, 40),
+      receipt_number: clip(e.receipt?.receiptNumber ?? null, 100),
+      items: (e.receipt?.items ?? []).slice(0, 200).map((i) => ({
+        name: clip(i.name, 200) ?? "Item",
+        translated_name: clip(i.translatedName, 200),
+        price: i.price,
+      })),
     })),
-    targetLanguage,
+    targetLanguage: targetLanguage.slice(0, 40),
   };
 }
 
@@ -156,7 +166,7 @@ function merchantMatches(e: Expense, merchants: string[]) {
   if (!merchants.length) return false;
   const names = [e.description, e.receipt?.merchant, e.receipt?.merchantTranslated]
     .map(normalize)
-    .filter((n) => n.length >= 3);
+    .filter((n) => n.length >= 2);
   return names.some((n) => merchants.some((m) => n.includes(m) || m.includes(n)));
 }
 
@@ -175,4 +185,10 @@ function relativeGap(a: number, b: number) {
 function daysBetween(a: string, b: string) {
   const ms = Date.parse(`${a}T00:00:00Z`) - Date.parse(`${b}T00:00:00Z`);
   return Number.isNaN(ms) ? null : Math.abs(ms) / 86_400_000;
+}
+
+function clip(value: string | null | undefined, max: number): string | null {
+  if (value == null) return null;
+  const trimmed = value.trim();
+  return trimmed ? trimmed.slice(0, max) : null;
 }

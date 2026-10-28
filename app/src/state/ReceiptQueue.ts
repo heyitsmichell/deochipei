@@ -46,7 +46,7 @@ export interface ReceiptQueueDeps {
   /** Units of `to` per 1 `from`. */
   rate: (from: string, to: string) => Promise<number>;
   /** The expense on `trip` that this receipt repeats, if any (see lib/duplicates.ts). */
-  findDuplicate: (trip: Trip, scan: ReceiptScan, rateToBase: number) => Promise<DuplicateMatch | null>;
+  findDuplicate: (trip: Trip, scan: ReceiptScan, rateToBase: number, excludeId?: string) => Promise<DuplicateMatch | null>;
 }
 
 type Outcome = "next" | "skip" | "stop";
@@ -71,6 +71,7 @@ export class ReceiptQueue {
   private loading?: Promise<void>;
   private running?: Promise<void>;
   private again = false;
+  private persistenceUnavailable = false;
   private retryTimer?: ReturnType<typeof setInterval>;
   private unsubscribeNetwork?: () => void;
   private readonly writer: CoalescedWriter;
@@ -182,9 +183,15 @@ export class ReceiptQueue {
    */
   process = (): Promise<void> => {
     this.again = true;
-    this.running ??= this.drainWhileAsked().finally(() => {
-      this.running = undefined;
-    });
+    if (!this.running) {
+      const run = this.drainWhileAsked();
+      let wrapped: Promise<void>;
+      wrapped = run.finally(() => {
+        this.running = undefined;
+        if (this.again) this.process();
+      });
+      this.running = wrapped;
+    }
     return this.running;
   };
 
@@ -211,7 +218,8 @@ export class ReceiptQueue {
       }
       if (raw) saved = JSON.parse(raw);
     } catch {
-      // Unreadable storage: start with an empty queue rather than crash.
+      // Do not overwrite a queue after a transient read failure.
+      this.persistenceUnavailable = true;
     }
     // Receipts for trips removed from this device in the meantime have nowhere to go.
     const kept = saved.filter((i) => this.deps.repo.getTrip(i.tripId));
@@ -277,7 +285,12 @@ export class ReceiptQueue {
       this.patch(item.id, { scan });
     }
 
-    if (!isCurrencyCode(scan.currency)) return this.fail(item, "Couldn't tell which currency the receipt is in.");
+    const normalizedCurrency = typeof scan.currency === "string" ? scan.currency.trim().toUpperCase() : "";
+    if (!isCurrencyCode(normalizedCurrency)) return this.fail(item, "Couldn't tell which currency the receipt is in.");
+    if (scan.currency !== normalizedCurrency) {
+      scan = { ...scan, currency: normalizedCurrency };
+      this.patch(item.id, { scan });
+    }
     if (!(scan.total > 0)) return this.fail(item, "Couldn't find the total on the receipt.");
 
     let rateToBase = 1;
@@ -296,7 +309,7 @@ export class ReceiptQueue {
       await this.deps.repo.refresh(trip.id);
       let match: DuplicateMatch | null;
       try {
-        match = await this.deps.findDuplicate(this.deps.repo.getTrip(trip.id) ?? trip, scan, rateToBase);
+        match = await this.deps.findDuplicate(this.deps.repo.getTrip(trip.id) ?? trip, scan, rateToBase, item.id);
       } catch (err) {
         if (err instanceof ApiError && err.isPermanent) {
           // The check itself was turned down. Add it anyway; it's flagged for review.
@@ -349,7 +362,7 @@ export class ReceiptQueue {
     const next = fn(this.items);
     if (next === this.items) return;
     this.items = next;
-    this.writer.save();
+    if (!this.persistenceUnavailable) this.writer.save();
     this.emit();
   }
 
@@ -358,10 +371,12 @@ export class ReceiptQueue {
   }
 
   clearForAccount = async () => {
-    const pending = [...this.items];
-    this.items = [];
+    const keep = this.items.filter((item) => !this.deps.repo.getTrip(item.tripId)?.syncEnabled);
+    const pending = this.items.filter((item) => !keep.includes(item));
+    this.items = keep;
+    this.persistenceUnavailable = false;
     this.writer.save();
-    await this.deps.storage.removeItem?.(this.storageKey).catch(() => {});
+    await this.writer.saved();
     await this.deps.storage.removeItem?.(`${this.storageKey}:backup`).catch(() => {});
     for (const item of pending) this.deps.files.remove(item.imageUri);
     this.emit();

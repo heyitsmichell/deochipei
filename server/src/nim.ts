@@ -31,6 +31,9 @@ export function getNimClient(): OpenAI {
   return new OpenAI({
     baseURL: getNimBaseUrl(),
     apiKey,
+    // Leave room for the vision fallback within the app's 120-second request limit.
+    timeout: 55_000,
+    maxRetries: 0,
   });
 }
 
@@ -64,19 +67,39 @@ export function extractJson<T = unknown>(raw: string): T {
     startIndex = firstBracket;
   }
 
-  const lastBrace = text.lastIndexOf("}");
-  const lastBracket = text.lastIndexOf("]");
-  const endIndex = Math.max(lastBrace, lastBracket);
-
-  if (startIndex !== -1 && endIndex !== -1 && endIndex >= startIndex) {
-    text = text.substring(startIndex, endIndex + 1).trim();
+  if (startIndex !== -1) {
+    const endIndex = findJsonEnd(text, startIndex);
+    if (endIndex !== -1) text = text.substring(startIndex, endIndex + 1).trim();
   }
 
   try {
     return JSON.parse(text) as T;
-  } catch (err) {
-    throw new Error(
-      `Failed to parse JSON from response: ${err instanceof Error ? err.message : String(err)}\nRaw text snippet: ${raw.slice(0, 300)}`
-    );
+  } catch {
+    throw new Error("Model returned malformed JSON.");
   }
+}
+
+function findJsonEnd(text: string, start: number): number {
+  const stack: string[] = [];
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < text.length; i++) {
+    const char = text[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') inString = false;
+      continue;
+    }
+    if (char === '"') {
+      inString = true;
+    } else if (char === "{" || char === "[") {
+      stack.push(char);
+    } else if (char === "}" || char === "]") {
+      const open = stack.pop();
+      if ((char === "}" && open !== "{") || (char === "]" && open !== "[")) return -1;
+      if (stack.length === 0) return i;
+    }
+  }
+  return -1;
 }

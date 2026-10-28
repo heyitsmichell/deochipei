@@ -29,14 +29,16 @@ app.use((req: Request, res: Response, next: NextFunction) => {
   next();
 });
 
-// Mobile apps send receipt photos in base64, so keep the payload large enough.
-app.use(express.json({ limit: "12mb" }));
+// Keep ordinary request bodies small. The receipt route opts into its larger
+// parser only after authentication has succeeded.
+const smallJson = express.json({ limit: "256kb" });
 
 // Simple in-memory limiter for AI requests.
 interface RateLimitEntry {
   timestamps: number[];
 }
 const aiRateLimitMap = new Map<string, RateLimitEntry>();
+const joinRateLimitMap = new Map<string, RateLimitEntry>();
 
 export function createAiRateLimiter(options: { windowMs: number; max: number; message: string }) {
   const { windowMs, max, message } = options;
@@ -75,6 +77,24 @@ export const aiRateLimiter = createAiRateLimiter({
 
 export function resetRateLimits(): void {
   aiRateLimitMap.clear();
+  joinRateLimitMap.clear();
+}
+
+function joinRateLimiter(req: Request, res: Response, next: NextFunction) {
+  const key = req.ip || req.socket.remoteAddress || "127.0.0.1";
+  const now = Date.now();
+  let entry = joinRateLimitMap.get(key);
+  if (!entry) {
+    entry = { timestamps: [] };
+    joinRateLimitMap.set(key, entry);
+  }
+  entry.timestamps = entry.timestamps.filter((timestamp) => now - timestamp < 60_000);
+  if (entry.timestamps.length >= 30) {
+    res.setHeader("Retry-After", "60");
+    return res.status(429).json({ error: "Too many invite lookups. Try again shortly." });
+  }
+  entry.timestamps.push(now);
+  return next();
 }
 
 // Check that the required environment variables are present on startup.
@@ -105,10 +125,28 @@ const MemberSchema = z.object({
   email: z.string().optional(),
   avatarUrl: z.string().optional(),
 });
-const ExpenseSchema = z.looseObject({ id: z.string().min(1), updatedAt: z.number() });
+const ExpenseSchema = z.looseObject({
+  id: z.string().min(1),
+  updatedAt: z.number().finite(),
+  amount: z.number().finite().positive(),
+});
 
 function notFound(res: Response) {
   res.status(404).json({ error: "Trip not found" });
+}
+
+function publicJoinTrip(trip: Trip) {
+  return {
+    id: trip.id,
+    code: trip.code,
+    name: trip.name,
+    baseCurrency: trip.baseCurrency,
+    members: trip.members.map(({ id, name }) => ({ id, name })),
+    expenses: [],
+    deletedExpenseIds: [],
+    updatedAt: trip.updatedAt,
+    inviteExpiresAt: trip.inviteExpiresAt,
+  };
 }
 
 export function extractParam(param: string | string[] | undefined): string {
@@ -119,8 +157,8 @@ app.get("/api/health", (_req, res) => {
   res.json({ ok: true });
 });
 
-// Require Supabase auth for all trip routes.
-app.use("/api/trips", requireAuth);
+// Authenticate before parsing any trip body.
+app.use("/api/trips", requireAuth, smallJson);
 
 app.get("/api/trips", requireAuth, (req: Request, res: Response) => {
   const userId = req.user!.id;
@@ -142,7 +180,11 @@ app.post("/api/trips", requireAuth, async (req: Request, res: Response) => {
     })
     .safeParse(req.body);
   if (!body.success) return res.status(400).json({ error: body.error.message });
-  if (store.get(body.data.id)) return res.status(409).json({ error: "Trip already exists" });
+  const existing = store.get(body.data.id);
+  if (existing) {
+    if (existing.ownerId === req.user!.id) return res.json(existing);
+    return res.status(409).json({ error: "Trip already exists" });
+  }
   const tripData = { ...body.data, ownerId: req.user!.id };
   try { res.json(await store.create(tripData)); } catch { res.status(409).json({ error: "Trip already exists" }); }
 });
@@ -155,7 +197,7 @@ app.get("/api/trips/:id", requireAuth, (req: Request, res: Response) => {
   if (!isMember) {
     return res.status(403).json({ error: "Not a member of this trip" });
   }
-  res.set("ETag", `"${trip.updatedAt}"`);
+  res.set("ETag", `"${trip.revision ?? trip.updatedAt}"`);
   return req.fresh ? res.status(304).end() : res.json(trip);
 });
 
@@ -177,15 +219,21 @@ app.post("/api/trips/:id/regenerate-invite", requireAuth, async (req: Request, r
   }
 });
 
-app.get("/api/join/:code", requireAuth, (req: Request, res: Response) => {
+app.get("/api/join/:code", joinRateLimiter, requireAuth, (req: Request, res: Response) => {
   const code = extractParam(req.params.code);
   const trip = store.findByCode(code);
   if (!trip) return res.status(404).json({ error: "No trip with that code or invite has expired" });
 
-  return res.json(trip);
+  return res.json({
+    id: trip.id,
+    name: trip.name,
+    baseCurrency: trip.baseCurrency,
+    memberCount: trip.members.length,
+    inviteExpiresAt: trip.inviteExpiresAt,
+  });
 });
 
-app.post("/api/join/:code", requireAuth, async (req: Request, res: Response) => {
+app.post("/api/join/:code", joinRateLimiter, requireAuth, smallJson, async (req: Request, res: Response) => {
   const code = extractParam(req.params.code);
   const trip = store.findByCode(code);
   if (!trip) {
@@ -194,7 +242,16 @@ app.post("/api/join/:code", requireAuth, async (req: Request, res: Response) => 
 
   const claimMemberId = typeof req.body?.claimMemberId === "string" ? req.body.claimMemberId : undefined;
   if (claimMemberId) {
-    const member = trip.members.find((m) => m.id === claimMemberId);
+    let member = trip.members.find((m) => m.id === claimMemberId);
+    if (!member && req.body?.member && typeof req.body.member === "object") {
+      const proposed = MemberSchema.safeParse({ ...req.body.member, id: claimMemberId });
+      if (!proposed.success || proposed.data.userId !== req.user!.id) {
+        return res.status(403).json({ error: "Only the authenticated user can add their own member record" });
+      }
+      const updated = await store.upsertMember(trip.id, proposed.data);
+      if (!updated) return notFound(res);
+      member = updated.members.find((m) => m.id === claimMemberId);
+    }
     if (!member) return res.status(404).json({ error: "Trip member not found" });
     if (member.userId && member.userId !== req.user!.id) return res.status(409).json({ error: "Member is already claimed" });
     try {
@@ -202,18 +259,12 @@ app.post("/api/join/:code", requireAuth, async (req: Request, res: Response) => 
         id: claimMemberId, userId: req.user!.id, name: req.user!.user_metadata?.full_name ?? "Traveller",
         email: req.user!.email,
       });
-      return res.json(updated);
+      return updated ? res.json(updated) : notFound(res);
     } catch (err) {
       return res.status(409).json({ error: err instanceof Error ? err.message : "Member is already claimed" });
     }
   }
-  const joined = await store.bindMember(trip.id, {
-    userId: req.user!.id,
-    name: req.user!.user_metadata?.full_name,
-    email: req.user!.email,
-  });
-  if (joined) return res.json(joined);
-  return res.json(trip);
+  return res.json(publicJoinTrip(trip));
 });
 
 app.patch("/api/trips/:id", requireAuth, async (req: Request, res: Response) => {
@@ -245,12 +296,19 @@ app.put("/api/trips/:id/members/:memberId", requireAuth, async (req: Request, re
   if (!trip) return notFound(res);
 
   const member = trip.members.find(m => m.id === memberId);
-  const mayEdit = trip.ownerId === req.user!.id || member?.userId === req.user!.id || member?.id === req.user!.id || body.data.userId === req.user!.id;
+  const isMember = trip.ownerId === req.user!.id || trip.members.some(m => m.userId === req.user!.id || m.id === req.user!.id);
+  if (!isMember) {
+    return res.status(403).json({ error: "Not a member of this trip" });
+  }
+  const mayEdit = trip.ownerId === req.user!.id || member?.userId === req.user!.id || member?.id === req.user!.id;
   if (!mayEdit) {
     return res.status(403).json({ error: "Only the trip owner can manage members" });
   }
 
-  const updated = await store.upsertMember(id, body.data);
+  const memberData = trip.ownerId === req.user!.id
+    ? body.data
+    : { ...body.data, userId: req.user!.id };
+  const updated = await store.upsertMember(id, memberData);
   return updated ? res.json(updated) : notFound(res);
 });
 
@@ -317,7 +375,7 @@ app.delete("/api/trips/:id/expenses/:expenseId", requireAuth, async (req: Reques
 
 // Invite links: the page a phone camera opens from a trip's QR code, plus the
 // files iOS and Android check before opening such links in the app directly.
-app.get("/join/:code", (req, res) => {
+app.get("/join/:code", joinRateLimiter, (req, res) => {
   const code = extractParam(req.params.code);
   if (!isValidInviteCode(code)) {
     return res.status(404).type("html").send(invitePage(undefined));
@@ -346,7 +404,10 @@ async function handleScanReceipt(req: Request, res: Response) {
       targetLanguage: z.string().min(2).max(40).default("English"),
     })
     .safeParse(req.body);
-  if (!body.success) return res.status(400).json({ error: body.error.message });
+  if (!body.success) {
+    console.warn("Invalid receipt scan request", body.error.issues);
+    return res.status(400).json({ error: "Invalid receipt scan request." });
+  }
 
   try {
     res.json(await scanReceipt(body.data));
@@ -355,27 +416,17 @@ async function handleScanReceipt(req: Request, res: Response) {
   }
 }
 
-const DuplicateCheckExtendedSchema = DuplicateCheckSchema.extend({
-  tripId: z.string().optional(),
-});
+const DuplicateCheckExtendedSchema = DuplicateCheckSchema;
 
 async function handleCheckDuplicate(req: Request, res: Response) {
   const body = DuplicateCheckExtendedSchema.safeParse(req.body);
-  if (!body.success) return res.status(400).json({ error: body.error.message });
-
-  const tripId = body.data.tripId;
-  let matchingTrip: Trip | undefined = undefined;
-
-  if (tripId) {
-    matchingTrip = store.get(tripId);
-    if (!matchingTrip) {
-      return notFound(res);
-    }
-  } else {
-    const candidateIds = new Set(body.data.candidates.map((c) => c.id));
-    const allTrips: Trip[] = store.list();
-    matchingTrip = allTrips.find((t) => t.expenses.some((e) => candidateIds.has(e.id)));
+  if (!body.success) {
+    console.warn("Invalid duplicate-check request", body.error.issues);
+    return res.status(400).json({ error: "Invalid duplicate-check request." });
   }
+
+  const matchingTrip = store.get(body.data.tripId);
+  if (!matchingTrip) return notFound(res);
 
   if (matchingTrip) {
     const userId = req.user!.id;
@@ -395,39 +446,9 @@ async function handleCheckDuplicate(req: Request, res: Response) {
 }
 
 // Protected AI Endpoints (require Supabase JWT and rate limiting)
-app.post("/api/scan-receipt", requireAuth, aiRateLimiter, handleScanReceipt);
-app.post("/api/check-duplicate", requireAuth, aiRateLimiter, handleCheckDuplicate);
-app.post("/api/check-duplicates", requireAuth, aiRateLimiter, handleCheckDuplicate);
-
-function sanitizeErrorMessage(msg: string): string {
-  const sensitivePatterns = [
-    /select\s+.*?\s+from/i,
-    /insert\s+into/i,
-    /update\s+.*?\s+set/i,
-    /delete\s+from/i,
-    /password/i,
-    /secret/i,
-    /api[_-]?key/i,
-    /token/i,
-    /bearer\s+/i,
-    /raw text snippet/i,
-    /\bat\s+.+:\d+:\d+/i,
-    /stack\s+trace/i,
-    /system_prompt/i,
-  ];
-
-  for (const pattern of sensitivePatterns) {
-    if (pattern.test(msg)) {
-      return "Scan failed";
-    }
-  }
-
-  if (msg.length > 200) {
-    return "Scan failed";
-  }
-
-  return msg;
-}
+app.post("/api/scan-receipt", requireAuth, express.json({ limit: "12mb" }), aiRateLimiter, handleScanReceipt);
+app.post("/api/check-duplicate", requireAuth, smallJson, aiRateLimiter, handleCheckDuplicate);
+app.post("/api/check-duplicates", requireAuth, smallJson, aiRateLimiter, handleCheckDuplicate);
 
 export function sendNIMError(res: Response, err: unknown) {
   if (err instanceof NotAReceiptError || err instanceof ScanRefusedError) {
@@ -468,8 +489,7 @@ export function sendNIMError(res: Response, err: unknown) {
     return res.status(502).json({ error: "The receipt reader is unavailable, try again." });
   }
   console.error("Server error:", err);
-  const rawMessage = err instanceof Error ? err.message : "Scan failed";
-  res.status(500).json({ error: sanitizeErrorMessage(rawMessage), retryable: false });
+  res.status(500).json({ error: "Scan failed. Please try again.", retryable: false });
 }
 
 // Global Express error handler (Express 5)

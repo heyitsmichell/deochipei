@@ -37,6 +37,7 @@ export interface PersistedData {
 export interface RepositorySnapshot {
   ready: boolean;
   online: boolean;
+  syncError?: string;
   data: PersistedData;
 }
 
@@ -61,7 +62,9 @@ export function applyOp(trip: Trip, op: Op): Trip {
       return {
         ...trip,
         expenses: trip.expenses.filter((e) => e.id !== op.expenseId),
-        deletedExpenseIds: [...trip.deletedExpenseIds, op.expenseId],
+        deletedExpenseIds: trip.deletedExpenseIds.includes(op.expenseId)
+          ? trip.deletedExpenseIds
+          : [...trip.deletedExpenseIds, op.expenseId],
       };
   }
 }
@@ -86,6 +89,9 @@ export class TripRepository {
   private loading?: Promise<void>;
   private starting?: Promise<void>;
   private flushing?: Promise<void>;
+  private flushAgain = false;
+  private readonly refreshing = new Map<string, Promise<void>>();
+  private persistenceUnavailable = false;
   private retryTimer?: ReturnType<typeof setInterval>;
   private readonly writer: CoalescedWriter;
 
@@ -172,13 +178,14 @@ export class TripRepository {
       deletedExpenseIds: [],
       updatedAt: Date.now(),
       ...(input.ownerId ? { ownerId: input.ownerId } : {}),
+      ...(input.ownerId ? { syncEnabled: true } : {}),
     };
     this.update((d) => ({
       ...d,
       trips: { ...d.trips, [trip.id]: trip },
       me: { ...d.me, [trip.id]: members[0].id },
     }));
-    if (trip.ownerId) this.enqueue({ kind: "createTrip", tripId: trip.id });
+    if (trip.syncEnabled) this.enqueue({ kind: "createTrip", tripId: trip.id });
     return trip;
   };
 
@@ -186,13 +193,9 @@ export class TripRepository {
     await this.ready();
     const trip = this.data.trips[tripId];
     if (!trip?.members.some((m) => m.id === memberId)) throw new ApiError("Trip member not found", 404);
-    if (trip.ownerId && user?.id && "claimMember" in this.api) {
+    if (trip.syncEnabled && user?.id) {
       const member = trip.members.find((m) => m.id === memberId)!;
-      if (member.userId === user.id && "upsertMember" in this.api) {
-        await this.api.upsertMember(tripId, member);
-      }
-      const updated = await (this.api as TripApi & { claimMember: (code: string, memberId: string) => Promise<Trip> })
-        .claimMember(trip.code ?? trip.inviteCode ?? "", memberId);
+      const updated = await this.api.claimMember(trip.code ?? trip.inviteCode ?? "", memberId, member);
       this.adopt(updated);
     }
     this.setMe(tripId, memberId, user);
@@ -212,15 +215,22 @@ export class TripRepository {
     let resolvedTrip = trip;
     if (user?.id) {
       const existing = trip.members.find(
-        (m) => m.userId === user.id || m.id === user.id || (m.email && m.email === user.email),
+        (m) => m.userId === user.id || m.id === user.id,
       );
       if (existing) {
-        existing.userId = user.id;
-        if (user.email) existing.email = user.email;
-        if (user.avatarUrl) existing.avatarUrl = user.avatarUrl;
+        const updatedMember = {
+          ...existing,
+          userId: user.id,
+          ...(user.email ? { email: user.email } : {}),
+          ...(user.avatarUrl ? { avatarUrl: user.avatarUrl } : {}),
+        };
+        resolvedTrip = {
+          ...trip,
+          members: trip.members.map((member) => (member.id === existing.id ? updatedMember : member)),
+        };
         this.update((d) => ({
           ...d,
-          me: { ...d.me, [trip.id]: existing.id },
+          me: { ...d.me, [resolvedTrip.id]: existing.id },
         }));
       }
     }
@@ -251,8 +261,9 @@ export class TripRepository {
   setMe = (tripId: string, memberId: string, user?: { id?: string; email?: string; avatarUrl?: string }) => {
     if (user?.id) {
       const current = this.member(tripId, memberId);
+      if (current?.userId && current.userId !== user.id) return;
       if (current && (current.userId !== user.id || current.email !== user.email || current.avatarUrl !== user.avatarUrl)) {
-        if (this.data.trips[tripId]?.ownerId) this.enqueue({ kind: "upsertMember", tripId, member: {
+        if (this.data.trips[tripId]?.syncEnabled) this.enqueue({ kind: "upsertMember", tripId, member: {
           ...current, userId: user.id, email: user.email, avatarUrl: user.avatarUrl,
         } });
       }
@@ -270,7 +281,12 @@ export class TripRepository {
     for (const tripId of Object.keys(this.data.trips)) this.publishHomeCurrency(tripId);
   };
 
-  addMember = (tripId: string, name: string, user?: { id?: string; email?: string; avatarUrl?: string }): Member => {
+  addMember = (
+    tripId: string,
+    name: string,
+    user?: { id?: string; email?: string; avatarUrl?: string },
+    queue = true,
+  ): Member => {
     const member: Member = {
       id: newId(), name: name.trim().slice(0, 60), userId: user?.id, email: user?.email, avatarUrl: user?.avatarUrl,
     };
@@ -278,7 +294,7 @@ export class TripRepository {
       const trip = d.trips[tripId];
       return trip ? { ...d, trips: { ...d.trips, [tripId]: applyOp(trip, { kind: "upsertMember", tripId, member }) } } : d;
     });
-    if (this.data.trips[tripId]?.ownerId) this.enqueue({ kind: "upsertMember", tripId, member });
+    if (queue && this.data.trips[tripId]?.syncEnabled) this.enqueue({ kind: "upsertMember", tripId, member });
     return member;
   };
 
@@ -290,7 +306,7 @@ export class TripRepository {
     const trip = this.data.trips[tripId];
     if (!trip) return;
     this.update((d) => ({ ...d, trips: { ...d.trips, [tripId]: applyOp(trip, { kind: "patchTrip", tripId, patch: normalized }) } }));
-    if (trip.ownerId) this.enqueue({ kind: "patchTrip", tripId, patch: normalized });
+    if (trip.syncEnabled) this.enqueue({ kind: "patchTrip", tripId, patch: normalized });
   };
 
   saveExpense = (tripId: string, expense: Expense) => {
@@ -298,42 +314,78 @@ export class TripRepository {
     if (!trip) return;
     const updated = { ...expense, updatedAt: Date.now() };
     this.update((d) => ({ ...d, trips: { ...d.trips, [tripId]: applyOp(trip, { kind: "upsertExpense", tripId, expense: updated }) } }));
-    if (trip.ownerId) this.enqueue({ kind: "upsertExpense", tripId, expense: updated });
+    if (trip.syncEnabled) this.enqueue({ kind: "upsertExpense", tripId, expense: updated });
   };
 
   deleteExpense = (tripId: string, expenseId: string) => {
     const trip = this.data.trips[tripId];
     if (!trip) return;
     this.update((d) => ({ ...d, trips: { ...d.trips, [tripId]: applyOp(trip, { kind: "deleteExpense", tripId, expenseId }) } }));
-    if (trip.ownerId) this.enqueue({ kind: "deleteExpense", tripId, expenseId });
+    if (trip.syncEnabled) this.enqueue({ kind: "deleteExpense", tripId, expenseId });
   };
 
   removeTripLocally = (tripId: string) =>
     this.update((d) => {
       const { [tripId]: _removed, ...trips } = d.trips;
-      return { ...d, trips, ops: d.ops.filter((o) => o.tripId !== tripId) };
+      return {
+        ...d,
+        trips,
+        ops: d.ops.filter((o) => o.tripId !== tripId),
+        failedOps: d.failedOps.filter((o) => o.tripId !== tripId),
+      };
     });
 
   updateSettings = (patch: Partial<Settings>) =>
     this.update((d) => ({ ...d, settings: { ...d.settings, ...patch } }));
 
   /** Push queued changes, then pull the latest copy of the trip if it has changed. */
-  refresh = async (tripId: string) => {
-    await this.flush();
-    try {
-      const server = await this.api.getTrip(tripId, this.data.trips[tripId]?.updatedAt);
-      if (server) this.adopt(server);
-      this.setOnline(true);
-    } catch (err) {
-      if (!(err instanceof ApiError)) this.setOnline(false);
-    }
+  refresh = (tripId: string): Promise<void> => {
+    const ongoing = this.refreshing.get(tripId);
+    if (ongoing) return ongoing;
+    const run = (async () => {
+      await this.flush();
+      try {
+        const local = this.data.trips[tripId];
+        const server = await this.api.getTrip(tripId, local?.revision);
+        if (server) this.adopt(server);
+        this.setOnline(true);
+        this.setSyncError(undefined);
+      } catch (err) {
+        if (err instanceof ApiError && !err.isRetryable) {
+          this.setOnline(true);
+          const message = err.status === 403 || err.status === 404
+            ? "This trip is no longer available to this account."
+            : "The trip could not be refreshed.";
+          console.warn("Trip refresh rejected", tripId, err.status, err.message);
+          this.setSyncError(message);
+        } else {
+          this.setOnline(false);
+          this.setSyncError("Trip sync is unavailable. Changes will retry when you reconnect.");
+        }
+      }
+    })();
+    this.refreshing.set(tripId, run);
+    return run.finally(() => {
+      if (this.refreshing.get(tripId) === run) this.refreshing.delete(tripId);
+    });
   };
 
   /** Sends queued ops in order. Concurrent callers share the same run. */
   flush = (): Promise<void> => {
-    this.flushing ??= this.drainQueue().finally(() => {
+    if (this.flushing) {
+      this.flushAgain = true;
+      return this.flushing;
+    }
+    const run = this.drainQueue();
+    let wrapped: Promise<void>;
+    wrapped = run.finally(() => {
       this.flushing = undefined;
+      if (this.flushAgain) {
+        this.flushAgain = false;
+        this.flush();
+      }
     });
+    this.flushing = wrapped;
     return this.flushing;
   };
 
@@ -346,7 +398,8 @@ export class TripRepository {
   private publishHomeCurrency(tripId: string) {
     const code = this.data.settings.homeCurrency;
     const me = this.member(tripId, this.data.me[tripId]);
-    if (code && me && me.homeCurrency !== code) {
+    const trip = this.data.trips[tripId];
+    if (trip?.syncEnabled && code && me && me.homeCurrency !== code) {
       this.enqueue({ kind: "upsertMember", tripId, member: { ...me, homeCurrency: code } });
     }
   }
@@ -366,7 +419,9 @@ export class TripRepository {
           }
         }
       }
+      if (!raw) raw = await this.storage.getItem(backupKeyBase);
     } catch {
+      this.persistenceUnavailable = true;
       this.snapshot = { ...this.snapshot, ready: true };
       this.emit();
       return;
@@ -374,15 +429,19 @@ export class TripRepository {
     if (raw) {
       try {
         const saved = JSON.parse(raw) as Partial<PersistedData>;
+        const trips = Object.fromEntries(
+          Object.entries(saved.trips ?? {}).map(([id, trip]) => [
+            id,
+            { ...trip, syncEnabled: trip.syncEnabled ?? Boolean(trip.ownerId) },
+          ]),
+        );
         this.snapshot = {
           ...this.snapshot,
-          data: { ...EMPTY, ...saved, ops: saved.ops ?? [], failedOps: saved.failedOps ?? [], settings: { ...EMPTY.settings, ...saved.settings } },
+          data: { ...EMPTY, ...saved, trips, ops: saved.ops ?? [], failedOps: saved.failedOps ?? [], settings: { ...EMPTY.settings, ...saved.settings } },
         };
       } catch {
-        const backupKey = `${backupKeyBase}:${Date.now()}`;
-        await this.storage.setItem(backupKey, raw).catch(() => {});
+        await this.storage.setItem(backupKeyBase, raw).catch(() => {});
         await this.storage.removeItem?.(this.storageKey).catch(() => {});
-        await this.storage.removeItem?.(`${this.storageKey}:backup`).catch(() => {});
         this.snapshot = { ...this.snapshot, data: EMPTY };
       }
     }
@@ -408,10 +467,6 @@ export class TripRepository {
           this.setOnline(false);
           return;
         }
-        if (err instanceof ApiError && err.status >= 400 && err.status < 500) {
-          this.parkOp(op);
-          continue;
-        }
         this.setOnline(false);
         return;
       }
@@ -423,7 +478,12 @@ export class TripRepository {
       case "createTrip": {
         const trip = this.data.trips[op.tripId];
         if (!trip) return Promise.reject(new ApiError("Trip was removed", 404));
-        return this.api.createTrip(trip);
+        return this.api.createTrip(trip).catch(async (err) => {
+          if (!(err instanceof ApiError) || err.status !== 409) throw err;
+          const existing = await this.api.getTrip(op.tripId);
+          if (!existing) throw err;
+          return existing;
+        });
       }
       case "patchTrip":
         return this.api.patchTrip(op.tripId, op.patch);
@@ -464,14 +524,26 @@ export class TripRepository {
       // Ignore late responses for trips removed from this device.
       if (!local && !allowNew) return d;
       const pending = d.ops.filter((o) => o.tripId === server.id);
-      // A slow poll must never roll the UI back over a newer local/server copy.
-      if (local && !pending.length && server.updatedAt < local.updatedAt) return d;
+      // Compare server-owned revisions when available; device timestamps are
+      // not comparable across clocks. Keep the timestamp fallback for older
+      // server copies that predate revisions.
+      if (local && !pending.length) {
+        if (server.revision != null && local.revision != null && server.revision < local.revision) return d;
+        if (server.revision == null && local.revision == null && server.updatedAt < local.updatedAt) return d;
+      }
       // Polling usually returns what we already have: skip the re-render and disk write.
-      if (local && !pending.length && local.updatedAt === server.updatedAt && local.code === server.code) {
+      if (
+        local &&
+        !pending.length &&
+        ((server.revision != null && local.revision != null && server.revision === local.revision) ||
+          (server.revision == null && local.revision == null && local.updatedAt === server.updatedAt)) &&
+        local.code === server.code
+      ) {
         return d;
       }
       const merged = pending.reduce(applyOp, {
         ...server,
+        syncEnabled: true,
         deletedExpenseIds: server.deletedExpenseIds ?? [],
       });
       return { ...d, trips: { ...d.trips, [server.id]: merged } };
@@ -482,7 +554,7 @@ export class TripRepository {
     const next = fn(this.data);
     if (next === this.data) return;
     this.snapshot = { ...this.snapshot, data: next };
-    this.writer.save();
+    if (!this.persistenceUnavailable) this.writer.save();
     this.emit();
   }
 
@@ -492,14 +564,35 @@ export class TripRepository {
     this.emit();
   }
 
+  private setSyncError(syncError: string | undefined) {
+    if (syncError === this.snapshot.syncError) return;
+    this.snapshot = { ...this.snapshot, syncError };
+    this.emit();
+  }
+
   private emit() {
     for (const listener of this.listeners) listener();
   }
 
   resetForAccount = async () => {
-    this.snapshot = { ...this.snapshot, data: EMPTY, ready: true };
+    const keepTrip = (trip: Trip) => !trip.syncEnabled;
+    const trips = Object.fromEntries(Object.entries(this.data.trips).filter(([, trip]) => keepTrip(trip)));
+    const guestIds = new Set(Object.keys(trips));
+    this.snapshot = {
+      ...this.snapshot,
+      data: {
+        ...EMPTY,
+        trips,
+        ops: this.data.ops.filter((op) => guestIds.has(op.tripId)),
+        failedOps: this.data.failedOps.filter((op) => guestIds.has(op.tripId)),
+        me: Object.fromEntries(Object.entries(this.data.me).filter(([tripId]) => guestIds.has(tripId))),
+        settings: this.data.settings,
+      },
+      ready: true,
+    };
+    this.persistenceUnavailable = false;
     this.writer.save();
-    await this.storage.removeItem?.(this.storageKey).catch(() => {});
+    await this.writer.saved();
     await this.storage.removeItem?.(`${this.storageKey}:backup`).catch(() => {});
     this.emit();
   };

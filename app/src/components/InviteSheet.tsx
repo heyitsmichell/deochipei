@@ -29,8 +29,7 @@ export function InviteSheet({ trip, visible, onClose }: { trip: Trip; visible: b
   const isOwner = Boolean(
     (liveTrip.ownerId && user?.id && liveTrip.ownerId === user.id) ||
     (liveTrip.ownerId && me && liveTrip.members.find((m) => m.id === me)?.userId === liveTrip.ownerId) ||
-    (!liveTrip.ownerId && me && liveTrip.members[0]?.id === me) ||
-    (me && liveTrip.members[0]?.id === me),
+    (!liveTrip.ownerId && me && liveTrip.members[0]?.id === me),
   );
 
   const share = () => {

@@ -3,7 +3,7 @@ import { makeRedirectUri } from "expo-auth-session";
 import * as Linking from "expo-linking";
 import * as WebBrowser from "expo-web-browser";
 import React, { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
-import { extractParamsFromUrl, handleAuthUrl } from "../lib/authUrl";
+import { extractParamsFromUrl, handleAuthUrl, isAuthCallbackUrl } from "../lib/authUrl";
 import { supabase } from "../lib/supabase";
 import { resetLocalAccountState } from "../state/TripsContext";
 
@@ -61,11 +61,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         setUser(currentSession?.user ?? null);
         setLoading(false);
       }
+      if (_event === "SIGNED_OUT") void resetLocalAccountState();
     });
 
     // Deep link listener for OAuth redirect callback
     const sub = Linking.addEventListener("url", async (event) => {
-      if (event.url && event.url.includes("auth/callback")) {
+      if (event.url && isAuthCallbackUrl(event.url)) {
         try {
           await handleAuthUrl(event.url);
         } catch (err) {
@@ -76,7 +77,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
     // Handle cold-start deep link where app opened directly to callback URL
     Linking.getInitialURL().then((initialUrl) => {
-      if (initialUrl && initialUrl.includes("auth/callback") && isMounted) {
+      if (initialUrl && isAuthCallbackUrl(initialUrl) && isMounted) {
         handleAuthUrl(initialUrl).catch((err) => {
           console.warn("Failed to handle initial auth callback URL:", err);
         });

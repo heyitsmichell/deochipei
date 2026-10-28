@@ -46,6 +46,7 @@ function RootStack() {
         <Stack.Screen name="join/[code]" options={{ title: "Join a trip", presentation: "modal" }} />
         <Stack.Screen name="converter" options={{ title: "Currency converter" }} />
         <Stack.Screen name="settings" options={{ title: "Settings" }} />
+        <Stack.Screen name="auth/callback" options={{ headerShown: false }} />
         <Stack.Screen name="trip/[id]/index" options={{ title: "" }} />
         <Stack.Screen name="trip/[id]/expense" options={{ title: "Expense", presentation: "modal" }} />
       </Stack>

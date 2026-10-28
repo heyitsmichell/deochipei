@@ -6,20 +6,24 @@ export const isISODate = (date: string | null): date is string => !!date && /^\d
 
 /** The parts of a scan the app keeps on the expense. */
 export function receiptFromScan(r: ReceiptScan): ReceiptData {
+  const textOrNull = (value: string | null | undefined) => {
+    const trimmed = value?.trim();
+    return trimmed ? trimmed : null;
+  };
   return {
-    merchant: r.merchant,
-    merchantTranslated: r.merchant_translated,
+    merchant: textOrNull(r.merchant),
+    merchantTranslated: textOrNull(r.merchant_translated),
     // Scans saved before these fields existed don't have them.
     receiptNumber: r.receipt_number ?? null,
     time: r.time ?? null,
     language: r.detected_language,
     items: r.items.map((i) => ({
       name: i.name,
-      translatedName: i.translated_name,
+      translatedName: textOrNull(i.translated_name),
       quantity: i.quantity,
       price: i.total_price,
     })),
-    notes: r.notes,
+    notes: textOrNull(r.notes),
     tax: r.tax,
     tip: r.tip,
     serviceCharge: r.service_charge,

@@ -40,9 +40,15 @@ export class CoalescedWriter {
   /** Marks the value changed; it's written shortly. */
   save() {
     this.unsaved = true;
-    this.saving ??= this.writeUntilSaved().finally(() => {
-      this.saving = undefined;
-    });
+    if (!this.saving) {
+      const run = this.writeUntilSaved();
+      let wrapped: Promise<void>;
+      wrapped = run.finally(() => {
+        if (this.saving === wrapped) this.saving = undefined;
+        if (this.unsaved) this.save();
+      });
+      this.saving = wrapped;
+    }
   }
 
   /** Resolves once every change so far has been written. */

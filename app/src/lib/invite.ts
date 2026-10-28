@@ -81,20 +81,22 @@ const INVITE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
 /**
  * Generates a fresh random invite code using unambiguous characters.
  */
-export function generateRandomInviteCode(length = 6, randomBytes: (length: number) => Uint8Array = secureRandomBytes): string {
+export function generateRandomInviteCode(length = 10, randomBytes: (length: number) => Uint8Array = secureRandomBytes): string {
   if (!Number.isInteger(length) || length < 6 || length > 36) {
     throw new Error("Invite code length must be between 6 and 36 characters.");
   }
-  let bytes: Uint8Array;
+  const limit = 256 - (256 % INVITE_ALPHABET.length);
+  let code = "";
   try {
-    // Expo Crypto uses native secure randomness on iOS/Android and Web Crypto on web.
-    bytes = randomBytes(length);
+    while (code.length < length) {
+      const bytes = randomBytes(Math.max(length, length - code.length));
+      for (const byte of bytes) {
+        if (byte < limit) code += INVITE_ALPHABET[byte % INVITE_ALPHABET.length];
+        if (code.length === length) break;
+      }
+    }
   } catch {
     throw new Error("Secure randomness is unavailable; cannot generate an invite code.");
-  }
-  let code = "";
-  for (let i = 0; i < length; i++) {
-    code += INVITE_ALPHABET[bytes[i] % INVITE_ALPHABET.length];
   }
   return code;
 }

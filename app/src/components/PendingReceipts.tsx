@@ -116,7 +116,7 @@ function DuplicateNote({ receipt: r, tripId }: { receipt: QueuedReceipt; tripId:
       ) : (
         <Text style={[styles.muted, { fontSize: 13 }]}>The matching expense has since been deleted.</Text>
       )}
-      {r.duplicate?.reason && <Text style={[styles.muted, { fontSize: 13, marginTop: 2 }]}>{r.duplicate.reason}</Text>}
+      {!!r.duplicate?.reason && <Text style={[styles.muted, { fontSize: 13, marginTop: 2 }]}>{r.duplicate.reason}</Text>}
       <View style={{ flexDirection: "row", gap: 16, marginTop: 6 }}>
         <Link title="Discard copy" onPress={() => discardReceipt(r.id)} />
         <Link title="Add anyway" onPress={addAnyway} />

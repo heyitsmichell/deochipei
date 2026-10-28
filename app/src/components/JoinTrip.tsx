@@ -129,7 +129,7 @@ export function JoinTrip({ initialCode }: { initialCode?: string }) {
             onPress={() => {
               const added = addMember(trip.id, newName, user?.id ? {
                 id: user.id, email: authEmail ?? user.email, avatarUrl: authAvatarUrl,
-              } : undefined);
+              } : undefined, false);
               void pick(added.id);
             }}
           />

@@ -2,57 +2,57 @@ import { z } from "zod";
 import OpenAI from "openai";
 import { extractJson, getNimClient, getVisionModel, getVisionFallbackModel } from "./nim.js";
 
+const CATEGORIES = ["food", "transport", "lodging", "activities", "shopping", "groceries", "other"] as const;
+const ISO_CURRENCY_CODES = new Set(
+  typeof Intl.supportedValuesOf === "function" ? Intl.supportedValuesOf("currency") : [],
+);
+const nullableText = z.preprocess(
+  (value) => (typeof value === "string" && value.trim() === "" ? null : value),
+  z.string().nullable().default(null),
+);
+const modelNumber = z.preprocess(
+  (value) => (value === null || value === "" ? undefined : value),
+  z.coerce.number().finite(),
+);
+const currencyCode = z
+  .preprocess((value) => (typeof value === "string" ? value.trim().toUpperCase() : value), z.string().regex(/^[A-Z]{3}$/))
+  .refine((value) => ISO_CURRENCY_CODES.size === 0 || ISO_CURRENCY_CODES.has(value), "Invalid ISO currency code");
+
 export const ReceiptSchema = z.object({
   is_receipt: z
     .boolean()
     .describe("False if the image is not a receipt, bill, or invoice"),
-  merchant: z.string().nullish().default(null).describe("Business name as printed"),
-  merchant_translated: z
-    .string()
-    .nullish()
-    .default(null)
-    .describe("Merchant name in the target language, or null if already in it"),
+  merchant: nullableText.describe("Business name as printed"),
+  merchant_translated: nullableText.describe("Merchant name in the target language, or null if already in it"),
   detected_language: z
     .string()
     .describe("Main language printed on the receipt, in English, e.g. 'Japanese'"),
-  country: z.string().nullish().default(null).describe("Country the receipt is likely from"),
-  currency: z
-    .string()
-    .describe("ISO 4217 code of the amounts on the receipt, e.g. JPY, EUR, THB"),
-  date: z.string().nullish().default(null).describe("Purchase date as YYYY-MM-DD"),
-  time: z.string().nullish().default(null).describe("Purchase time as HH:MM (24-hour), if printed"),
-  receipt_number: z
-    .string()
-    .nullish()
-    .default(null)
-    .describe("Receipt, transaction, invoice or check number exactly as printed, if any"),
+  country: nullableText.describe("Country the receipt is likely from"),
+  currency: currencyCode.describe("ISO 4217 code of the amounts on the receipt, e.g. JPY, EUR, THB"),
+  date: nullableText.describe("Purchase date as YYYY-MM-DD"),
+  time: nullableText.describe("Purchase time as HH:MM (24-hour), if printed"),
+  receipt_number: nullableText.describe("Receipt, transaction, invoice or check number exactly as printed, if any"),
   items: z.array(
     z.object({
       name: z.string().describe("Line item text exactly as printed"),
-      translated_name: z.string().nullable().default(null).describe("Line item in the target language"),
-      quantity: z.coerce.number(),
-      total_price: z.coerce.number().describe("Line total for this item"),
+      translated_name: nullableText.describe("Line item in the target language"),
+      quantity: modelNumber,
+      total_price: modelNumber.describe("Line total for this item"),
     }),
+  ).max(200),
+  subtotal: modelNumber.nullish().default(null),
+  tax: modelNumber.nullish().default(null),
+  tip: modelNumber.nullish().default(null),
+  service_charge: modelNumber.nullish().default(null),
+  total: modelNumber.refine((value) => value > 0, "Total must be greater than zero").describe("Final amount paid, including tax, tip and service"),
+  category: z.preprocess(
+    (value) => {
+      const normalized = typeof value === "string" ? value.toLowerCase() : "";
+      return CATEGORIES.includes(normalized as (typeof CATEGORIES)[number]) ? normalized : "other";
+    },
+    z.enum(CATEGORIES),
   ),
-  subtotal: z.number().nullish().default(null),
-  tax: z.number().nullish().default(null),
-  tip: z.number().nullish().default(null),
-  service_charge: z.number().nullish().default(null),
-  total: z.number().describe("Final amount paid, including tax, tip and service"),
-  category: z.preprocess((v) => typeof v === "string" ? v.toLowerCase() : v, z.enum([
-    "food",
-    "transport",
-    "lodging",
-    "activities",
-    "shopping",
-    "groceries",
-    "other",
-  ])),
-  notes: z
-    .string()
-    .nullish()
-    .default(null)
-    .describe("Anything the traveller should double-check, in the target language"),
+  notes: nullableText.describe("Anything the traveller should double-check, in the target language"),
 });
 
 export type ReceiptScan = z.infer<typeof ReceiptSchema>;
