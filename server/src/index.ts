@@ -182,12 +182,6 @@ app.get("/api/join/:code", requireAuth, (req: Request, res: Response) => {
   const trip = store.findByCode(code);
   if (!trip) return res.status(404).json({ error: "No trip with that code or invite has expired" });
 
-  // Check if user is already a member
-  const isMember = trip.members.some(m => m.userId === req.user!.id || m.id === req.user!.id);
-  if (!isMember) {
-    return res.status(403).json({ error: "Not a member of this trip" });
-  }
-
   return res.json(trip);
 });
 
@@ -213,7 +207,12 @@ app.post("/api/join/:code", requireAuth, async (req: Request, res: Response) => 
       return res.status(409).json({ error: err instanceof Error ? err.message : "Member is already claimed" });
     }
   }
-  // Lookup is non-mutating. The picker must explicitly claim or add a member.
+  const joined = await store.bindMember(trip.id, {
+    userId: req.user!.id,
+    name: req.user!.user_metadata?.full_name,
+    email: req.user!.email,
+  });
+  if (joined) return res.json(joined);
   return res.json(trip);
 });
 
@@ -246,7 +245,7 @@ app.put("/api/trips/:id/members/:memberId", requireAuth, async (req: Request, re
   if (!trip) return notFound(res);
 
   const member = trip.members.find(m => m.id === memberId);
-  const mayEdit = trip.ownerId === req.user!.id || member?.userId === req.user!.id || member?.id === req.user!.id;
+  const mayEdit = trip.ownerId === req.user!.id || member?.userId === req.user!.id || member?.id === req.user!.id || body.data.userId === req.user!.id;
   if (!mayEdit) {
     return res.status(403).json({ error: "Only the trip owner can manage members" });
   }
@@ -305,6 +304,11 @@ app.delete("/api/trips/:id/expenses/:expenseId", requireAuth, async (req: Reques
   const isMember = trip.ownerId === req.user!.id || trip.members.some(m => m.userId === req.user!.id || m.id === req.user!.id);
   if (!isMember) {
     return res.status(403).json({ error: "Not a member of this trip" });
+  }
+
+  const existing = trip.expenses.find((e) => e.id === expenseId);
+  if (!canEditExpense(trip, req.user!.id, existing)) {
+    return res.status(403).json({ error: "Only the expense creator or trip owner can delete this expense" });
   }
 
   const updated = await store.deleteExpense(id, expenseId);

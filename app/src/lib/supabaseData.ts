@@ -1,15 +1,13 @@
 import type { Expense, Member, Trip } from "./types";
 import { ApiError } from "./errors";
 import { supabase, isSupabaseConfigured } from "./supabase";
+import { generateRandomInviteCode } from "./invite";
 
 const directModeEnabled =
   isSupabaseConfigured && process.env.EXPO_PUBLIC_SUPABASE_DATA_MODE !== "legacy";
 
 function secureInviteCode() {
-  const alphabet = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
-  const values = new Uint8Array(6);
-  if (typeof crypto !== "undefined" && crypto.getRandomValues) crypto.getRandomValues(values);
-  return Array.from(values, (v) => alphabet[v % alphabet.length]).join("");
+  return generateRandomInviteCode();
 }
 
 function supabaseErrorStatus(code?: string) {
@@ -100,7 +98,7 @@ function toExpense(row: Record<string, any>): Expense {
       return value && typeof value === "object" && Object.keys(value).length ? value : undefined;
     })(),
     needsReview: Boolean(row.needs_review ?? false),
-    createdAt: Number(row.created_at ?? row.createdAt ?? Date.now()),
+    createdAt: toTimestamp(row.created_at ?? row.createdAt),
     updatedAt: toTimestamp(row.updated_at ?? row.updatedAt),
   };
 }
@@ -121,7 +119,7 @@ export const supabaseData = {
       const trip = toTrip(data);
       if (knownVersion != null && trip.updatedAt <= knownVersion) return null;
       return trip;
-    }, async () => null);
+    }, async () => { throw new ApiError("Trip sync is unavailable", 503); });
   },
 
   async createTrip(trip: Trip): Promise<Trip> {
@@ -139,8 +137,32 @@ export const supabaseData = {
         .single();
 
       if (error) throw new ApiError(error.message, supabaseErrorStatus(error.code));
+
+      const members = trip.members.map((member) => ({
+        id: member.id, trip_id: trip.id, display_name: member.name,
+        ...(member.userId !== undefined ? { user_id: member.userId } : {}),
+        ...(member.homeCurrency !== undefined ? { home_currency: member.homeCurrency } : {}),
+        ...(member.email !== undefined ? { email: member.email } : {}),
+        ...(member.avatarUrl !== undefined ? { avatar_url: member.avatarUrl } : {}),
+      }));
+      if (members.length) {
+        const result = await supabase.from("trip_members").upsert(members);
+        if (result.error) throw new ApiError(result.error.message, supabaseErrorStatus(result.error.code));
+      }
+      if (trip.expenses.length) {
+        const expenses = trip.expenses.map((expense) => ({
+          id: expense.id, trip_id: trip.id, title: expense.description, description: expense.description,
+          amount: expense.amount, currency: expense.currency, rate_to_base: expense.rateToBase,
+          paid_by: expense.paidBy, created_by: (expense as Expense & { createdBy?: string }).createdBy,
+          category: expense.category, date: expense.date, receipt_data: expense.receipt ?? null,
+          split_definition: expense.split, needs_review: expense.needsReview ?? false,
+          created_at: new Date(expense.createdAt).toISOString(), updated_at: new Date(expense.updatedAt).toISOString(),
+        }));
+        const result = await supabase.from("expenses").upsert(expenses);
+        if (result.error) throw new ApiError(result.error.message, supabaseErrorStatus(result.error.code));
+      }
       return toTrip(data);
-    }, async () => trip);
+    }, async () => { throw new ApiError("Trip creation is unavailable", 503); });
   },
 
   async joinTrip(
@@ -177,19 +199,21 @@ export const supabaseData = {
 
   async regenerateTripInvite(tripId: string): Promise<Trip> {
     return withDirectSupabase(async () => {
-      const { data, error } = await supabase
-        .from("trips")
-        .update({
-          invite_code: secureInviteCode(),
-          invite_expires_at: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
-          updated_at: new Date().toISOString(),
-        })
-        .eq("id", tripId)
-        .select("*, trip_members(*), expenses(*)")
-        .single();
-
-      if (error) throw new ApiError(error.message, supabaseErrorStatus(error.code));
-      return toTrip(data);
+      for (let attempt = 0; attempt < 5; attempt++) {
+        const { data, error } = await supabase
+          .from("trips")
+          .update({
+            invite_code: secureInviteCode(),
+            invite_expires_at: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", tripId)
+          .select("*, trip_members(*), expenses(*)")
+          .single();
+        if (!error) return toTrip(data);
+        if (error.code !== "23505") throw new ApiError(error.message, supabaseErrorStatus(error.code));
+      }
+      throw new ApiError("Could not generate a unique invite code", 503);
     }, async () => {
       throw new ApiError("Invite regeneration is unavailable", 503);
     });
@@ -222,11 +246,11 @@ export const supabaseData = {
         .upsert({
           id: member.id,
           trip_id: id,
-          user_id: member.userId ?? null,
           display_name: member.name,
-          home_currency: member.homeCurrency ?? null,
-          email: member.email,
-          avatar_url: member.avatarUrl,
+          ...(member.userId !== undefined ? { user_id: member.userId } : {}),
+          ...(member.homeCurrency !== undefined ? { home_currency: member.homeCurrency } : {}),
+          ...(member.email !== undefined ? { email: member.email } : {}),
+          ...(member.avatarUrl !== undefined ? { avatar_url: member.avatarUrl } : {}),
           updated_at: new Date().toISOString(),
         })
         .select("*")

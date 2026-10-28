@@ -71,8 +71,16 @@ export function JoinTrip({ initialCode }: { initialCode?: string }) {
   const pick = async (memberId: string) => {
     if (!trip) return;
     const identity = user?.id ? { id: user.id, email: authEmail ?? user.email, avatarUrl: authAvatarUrl } : undefined;
-    await claimTripMember(trip.id, memberId, identity);
-    router.replace(`/trip/${trip.id}`);
+    setError(null);
+    setLoading(true);
+    try {
+      await claimTripMember(trip.id, memberId, identity);
+      router.replace(`/trip/${trip.id}`);
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Couldn't join this trip. Check your connection and try again.");
+    } finally {
+      setLoading(false);
+    }
   };
 
   return (
@@ -122,7 +130,7 @@ export function JoinTrip({ initialCode }: { initialCode?: string }) {
               const added = addMember(trip.id, newName, user?.id ? {
                 id: user.id, email: authEmail ?? user.email, avatarUrl: authAvatarUrl,
               } : undefined);
-              pick(added.id);
+              void pick(added.id);
             }}
           />
         </Card>

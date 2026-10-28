@@ -140,6 +140,7 @@ export class TripRepository {
   meFor = (tripId: string): string | undefined => this.data.me[tripId];
 
   pendingCount = (tripId: string) => this.data.ops.filter((o) => o.tripId === tripId).length;
+  failedCount = (tripId: string) => this.data.failedOps.filter((o) => o.tripId === tripId).length;
 
   // ── Commands ────────────────────────────────────────────────────────────
 
@@ -186,6 +187,10 @@ export class TripRepository {
     const trip = this.data.trips[tripId];
     if (!trip?.members.some((m) => m.id === memberId)) throw new ApiError("Trip member not found", 404);
     if (trip.ownerId && user?.id && "claimMember" in this.api) {
+      const member = trip.members.find((m) => m.id === memberId)!;
+      if (member.userId === user.id && "upsertMember" in this.api) {
+        await this.api.upsertMember(tripId, member);
+      }
       const updated = await (this.api as TripApi & { claimMember: (code: string, memberId: string) => Promise<Trip> })
         .claimMember(trip.code ?? trip.inviteCode ?? "", memberId);
       this.adopt(updated);
@@ -269,24 +274,39 @@ export class TripRepository {
     const member: Member = {
       id: newId(), name: name.trim().slice(0, 60), userId: user?.id, email: user?.email, avatarUrl: user?.avatarUrl,
     };
+    this.update((d) => {
+      const trip = d.trips[tripId];
+      return trip ? { ...d, trips: { ...d.trips, [tripId]: applyOp(trip, { kind: "upsertMember", tripId, member }) } } : d;
+    });
     if (this.data.trips[tripId]?.ownerId) this.enqueue({ kind: "upsertMember", tripId, member });
     return member;
   };
 
-  patchTrip = (tripId: string, patch: TripPatch) => this.data.trips[tripId]?.ownerId && this.enqueue({
-    kind: "patchTrip",
-    tripId,
-    patch: {
+  patchTrip = (tripId: string, patch: TripPatch) => {
+    const normalized = {
       ...(patch.name !== undefined ? { name: patch.name.trim().slice(0, 80) } : {}),
       ...(patch.baseCurrency !== undefined ? { baseCurrency: patch.baseCurrency } : {}),
-    },
-  });
+    };
+    const trip = this.data.trips[tripId];
+    if (!trip) return;
+    this.update((d) => ({ ...d, trips: { ...d.trips, [tripId]: applyOp(trip, { kind: "patchTrip", tripId, patch: normalized }) } }));
+    if (trip.ownerId) this.enqueue({ kind: "patchTrip", tripId, patch: normalized });
+  };
 
-  saveExpense = (tripId: string, expense: Expense) =>
-    this.data.trips[tripId]?.ownerId && this.enqueue({ kind: "upsertExpense", tripId, expense: { ...expense, updatedAt: Date.now() } });
+  saveExpense = (tripId: string, expense: Expense) => {
+    const trip = this.data.trips[tripId];
+    if (!trip) return;
+    const updated = { ...expense, updatedAt: Date.now() };
+    this.update((d) => ({ ...d, trips: { ...d.trips, [tripId]: applyOp(trip, { kind: "upsertExpense", tripId, expense: updated }) } }));
+    if (trip.ownerId) this.enqueue({ kind: "upsertExpense", tripId, expense: updated });
+  };
 
-  deleteExpense = (tripId: string, expenseId: string) =>
-    this.data.trips[tripId]?.ownerId && this.enqueue({ kind: "deleteExpense", tripId, expenseId });
+  deleteExpense = (tripId: string, expenseId: string) => {
+    const trip = this.data.trips[tripId];
+    if (!trip) return;
+    this.update((d) => ({ ...d, trips: { ...d.trips, [tripId]: applyOp(trip, { kind: "deleteExpense", tripId, expenseId }) } }));
+    if (trip.ownerId) this.enqueue({ kind: "deleteExpense", tripId, expenseId });
+  };
 
   removeTripLocally = (tripId: string) =>
     this.update((d) => {
@@ -333,8 +353,9 @@ export class TripRepository {
 
   private async load() {
     const backupKeyBase = `${this.storageKey}:backup`;
+    let raw: string | null;
     try {
-      let raw = await this.storage.getItem(this.storageKey);
+      raw = await this.storage.getItem(this.storageKey);
       if (!raw && this.storageKey === "deochipei:v1") {
         const legacy = await this.storage.getItem("travelsplit:v1");
         if (legacy) {
@@ -345,22 +366,25 @@ export class TripRepository {
           }
         }
       }
-      if (raw) {
+    } catch {
+      this.snapshot = { ...this.snapshot, ready: true };
+      this.emit();
+      return;
+    }
+    if (raw) {
+      try {
         const saved = JSON.parse(raw) as Partial<PersistedData>;
         this.snapshot = {
           ...this.snapshot,
           data: { ...EMPTY, ...saved, ops: saved.ops ?? [], failedOps: saved.failedOps ?? [], settings: { ...EMPTY.settings, ...saved.settings } },
         };
-      }
-    } catch {
-      const raw = await this.storage.getItem(this.storageKey).catch(() => null);
-      if (raw) {
+      } catch {
         const backupKey = `${backupKeyBase}:${Date.now()}`;
         await this.storage.setItem(backupKey, raw).catch(() => {});
+        await this.storage.removeItem?.(this.storageKey).catch(() => {});
+        await this.storage.removeItem?.(`${this.storageKey}:backup`).catch(() => {});
+        this.snapshot = { ...this.snapshot, data: EMPTY };
       }
-      await this.storage.removeItem?.(this.storageKey).catch(() => {});
-      await this.storage.removeItem?.(`${this.storageKey}:backup`).catch(() => {});
-      this.snapshot = { ...this.snapshot, data: EMPTY };
     }
     this.snapshot = { ...this.snapshot, ready: true };
     this.emit();
@@ -383,6 +407,10 @@ export class TripRepository {
         if (err instanceof ApiError && err.isRetryable) {
           this.setOnline(false);
           return;
+        }
+        if (err instanceof ApiError && err.status >= 400 && err.status < 500) {
+          this.parkOp(op);
+          continue;
         }
         this.setOnline(false);
         return;

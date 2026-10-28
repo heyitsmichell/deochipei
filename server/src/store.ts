@@ -173,7 +173,6 @@ export class TripStore {
       member.userId = user.userId;
       if (user.email) member.email = user.email;
       if (user.avatarUrl) member.avatarUrl = user.avatarUrl;
-      if (user.name) member.name = user.name;
     });
   }
 

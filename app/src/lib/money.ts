@@ -115,7 +115,9 @@ export function parseAmount(text: string): number | null {
     // Comma is the decimal separator if it has 1-2 digits after it.
     s = /,\d{1,2}$/.test(s) ? s.replace(/\./g, "").replace(",", ".") : s.replace(/,/g, "");
   } else {
-    s = /^-?\d+\.\d{3}$/.test(s) ? s.replace(".", "") : s.replace(/,/g, "");
+    // A dot is unambiguously the decimal separator here. In particular,
+    // preserve three-decimal input such as 0.125 and 2.500.
+    s = s.replace(/,/g, "");
   }
   const n = Number(s);
   return Number.isFinite(n) ? n : null;

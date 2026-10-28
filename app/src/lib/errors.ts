@@ -16,6 +16,6 @@ export class ApiError extends Error {
   /** The server rejected the request for good; retrying won't help. */
   get isPermanent() {
     if (this.isRetryable) return false;
-    return [400, 403, 404, 409, 410, 422].includes(this.status);
+    return this.status >= 400 && this.status < 500;
   }
 }

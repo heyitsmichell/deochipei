@@ -16,6 +16,7 @@ import {
   useNetwork,
   useOnline,
   usePendingCount,
+  useFailedCount,
   useTrip,
   useTripActions,
 } from "../../../state/TripsContext";
@@ -61,6 +62,7 @@ function TripView({ trip }: { trip: Trip }) {
   const { user, displayName: authName, avatarUrl: authAvatar } = useAuth();
   const me = useMe(trip.id);
   const pending = usePendingCount(trip.id);
+  const failed = useFailedCount(trip.id);
   const online = useOnline();
   const network = useNetwork();
   const [tab, setTab] = useState<Tab>("expenses");
@@ -126,11 +128,13 @@ function TripView({ trip }: { trip: Trip }) {
 
   const header = (
     <>
-      {(pending > 0 || !online) && (
+      {(pending > 0 || failed > 0 || !online) && (
         <Banner>
           {online
             ? `Syncing ${pending} change${pending === 1 ? "" : "s"}…`
-            : `Offline${pending ? ` — ${pending} change${pending === 1 ? "" : "s"} waiting to sync` : ""}. ` +
+            : failed
+              ? `${failed} change${failed === 1 ? "" : "s"} was rejected by the server. Review it while online.`
+              : `Offline${pending ? ` — ${pending} change${pending === 1 ? "" : "s"} waiting to sync` : ""}. ` +
               "Receipts you snap are saved and read once you're back on Wi-Fi."}
         </Banner>
       )}

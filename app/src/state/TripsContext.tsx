@@ -121,6 +121,9 @@ export const useMe = (tripId: string): string | undefined => useRepository((s) =
 export const usePendingCount = (tripId: string) =>
   useRepository((s) => s.data.ops.reduce((n, op) => (op.tripId === tripId ? n + 1 : n), 0));
 
+export const useFailedCount = (tripId: string) =>
+  useRepository((s) => s.data.failedOps.reduce((n, op) => (op.tripId === tripId ? n + 1 : n), 0));
+
 /** All trips on this phone, most recently changed first. */
 export function useTripList() {
   const trips = useRepository((s) => s.data.trips);
