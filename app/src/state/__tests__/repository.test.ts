@@ -418,12 +418,20 @@ test("receipt restoration preserves local data when the server receipt is missin
 test("receipt restoration holds damaged pending upserts until the server copy is validated", async (t) => {
   let resolveFetch!: (value: Trip) => void;
   let upserts = 0;
+  let unrelatedUpserts = 0;
   const original = expense({ receipt: { items: { original: "Retain me" } } as unknown as ReceiptData });
   const restored = expense({ receipt: { merchant: null, merchantTranslated: null, language: "English", notes: null,
     items: [{ name: "Meal", translatedName: null, quantity: 1, price: 10 }] } });
   const { repo } = await repository({
     getTrip: () => new Promise((resolve) => { resolveFetch = resolve; }),
-    upsertExpense: async () => { upserts++; throw new ApiError("Temporarily unavailable", 503); },
+    upsertExpense: async (_tripId, value) => {
+      if (value.id === "other") {
+        unrelatedUpserts++;
+        return trip({ expenses: [restored, value], revision: 2 });
+      }
+      upserts++;
+      throw new ApiError("Temporarily unavailable", 503);
+    },
     deleteExpense: async () => assert.fail("Restoration must never delete"),
   });
   repo.saveExpense("trip", original);
@@ -434,11 +442,16 @@ test("receipt restoration holds damaged pending upserts until the server copy is
   const restoring = repo.removeDamagedExpense("trip", 0, repo.getTrip("trip")!.expenses[0], true);
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(repo.pendingCount("trip"), 1);
+  repo.saveExpense("trip", expense({ id: "other", description: "Unrelated edit" }));
   await repo.flush();
   assert.equal(upserts, 1);
+  assert.equal(unrelatedUpserts, 0);
   resolveFetch(trip({ expenses: [restored] }));
   await restoring;
-  assert.deepEqual(repo.getTrip("trip")!.expenses, [restored]);
+  assert.equal(unrelatedUpserts, 1);
+  await repo.flush();
+  assert.deepEqual(repo.getTrip("trip")!.expenses.find((value) => value.id === restored.id), restored);
+  assert.equal(repo.getTrip("trip")!.expenses.find((value) => value.id === "other")!.description, "Unrelated edit");
   assert.equal(repo.pendingCount("trip"), 0);
 });
 
@@ -455,8 +468,6 @@ test("failed receipt restoration retains unsent edits and releases their tempora
   await assert.rejects(repo.removeDamagedExpense("trip", 0, before, true), /No intact server receipt/);
   assert.equal(repo.getTrip("trip")!.expenses[0], before);
   assert.equal(repo.pendingCount("trip"), 1);
-  assert.equal(upserts, 1);
-  await repo.flush();
   assert.equal(upserts, 2);
 });
 

@@ -558,7 +558,10 @@ export class TripRepository {
         }
         return this.deleteExpense(tripId, entry.id);
       } finally {
-        if (restoreOnly) this.receiptRestorations.delete(restorationKey);
+        if (restoreOnly) {
+          this.receiptRestorations.delete(restorationKey);
+          if (epoch === this.epoch) void this.flush();
+        }
       }
     }
     if (restoreOnly) throw new Error("This expense has no shared server copy. The saved details have been kept.");
