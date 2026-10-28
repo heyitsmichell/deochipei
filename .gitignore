@@ -1,0 +1,23 @@
+# Local environment
+.env
+.env.*
+**/.env
+**/.env.*
+
+# Local Supabase schema snapshots / setup files
+supabase/
+
+# Test files are source and should be tracked. Generated reports remain ignored
+# by the build-specific rules below.
+
+# Node / Expo / build output
+node_modules/
+**/node_modules/
+.expo/
+**/.expo/
+dist/
+web-build/
+
+# OS / editor noise
+.DS_Store
+Thumbs.db

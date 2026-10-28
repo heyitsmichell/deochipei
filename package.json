@@ -1,0 +1,9 @@
+{
+  "name": "deochipei-workspace",
+  "private": true,
+  "scripts": {
+    "typecheck": "npm --prefix app run typecheck && npm --prefix server run typecheck",
+    "lint": "npm --prefix app run lint && npm --prefix server run lint",
+    "test": "npm --prefix app test && npm --prefix server test"
+  }
+}
