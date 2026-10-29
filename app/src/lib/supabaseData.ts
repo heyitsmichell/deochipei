@@ -1,4 +1,4 @@
-import type { Expense, Member, Trip } from "./types";
+import type { Expense, Member, Settlement, Trip, TripPatch } from "./types";
 import { ApiError } from "./errors";
 import { supabase, isSupabaseConfigured } from "./supabase";
 import { generateRandomInviteCode } from "./invite";
@@ -47,9 +47,14 @@ function toTrip(row: Record<string, any>): Trip {
     inviteCode: row.invite_code ?? row.inviteCode,
     name: row.name ?? "",
     baseCurrency: row.currency ?? row.baseCurrency ?? "USD",
+    ...(row.budget != null && Number.isFinite(Number(row.budget)) ? { budget: Number(row.budget) } : {}),
     members: Array.isArray(row.trip_members) ? row.trip_members.map(toMember) : [],
     expenses: Array.isArray(row.expenses) ? row.expenses.filter((e) => !e.deleted_at).map(toExpense) : [],
+    settlements: Array.isArray(row.trip_settlements)
+      ? row.trip_settlements.filter((settlement) => !settlement.deleted_at).map(toSettlement)
+      : [],
     deletedExpenseIds: Array.isArray(row.deleted_expense_ids) ? row.deleted_expense_ids : [],
+    deletedSettlementIds: Array.isArray(row.deleted_settlement_ids) ? row.deleted_settlement_ids : [],
     updatedAt: toTimestamp(row.updated_at ?? row.updatedAt),
     ownerId: row.owner_id ?? row.ownerId ?? row.created_by ?? row.createdBy,
     syncEnabled: true,
@@ -115,6 +120,25 @@ function toExpense(row: Record<string, any>): Expense {
       return value && typeof value === "object" && Object.keys(value).length ? value : undefined;
     })(),
     needsReview: Boolean(row.needs_review ?? false),
+    rateSource: row.rate_source ?? row.rateSource,
+    rateFetchedAt: row.rate_fetched_at != null ? toTimestamp(row.rate_fetched_at) : undefined,
+    createdAt: toTimestamp(row.created_at ?? row.createdAt),
+    updatedAt: toTimestamp(row.updated_at ?? row.updatedAt),
+    revision: Number.isInteger(row.revision) ? row.revision : undefined,
+  };
+}
+
+function toSettlement(row: Record<string, any>): Settlement {
+  return {
+    id: row.id,
+    from: row.from_member ?? row.from,
+    to: row.to_member ?? row.to,
+    amount: Number(row.amount),
+    currency: row.currency ?? "USD",
+    date: row.date ?? new Date().toISOString().slice(0, 10),
+    method: row.method ?? undefined,
+    note: row.note ?? undefined,
+    createdBy: row.created_by ?? row.createdBy,
     createdAt: toTimestamp(row.created_at ?? row.createdAt),
     updatedAt: toTimestamp(row.updated_at ?? row.updatedAt),
     revision: Number.isInteger(row.revision) ? row.revision : undefined,
@@ -126,7 +150,7 @@ export const supabaseData = {
   async listTrips(): Promise<Trip[]> {
     return withDirectSupabase(async () => {
       // RLS restricts this list to trips the authenticated account can read.
-      const { data, error } = await supabase.from("trips").select("*, trip_members(*), expenses(*)");
+      const { data, error } = await supabase.from("trips").select("*, trip_members(*), expenses(*), trip_settlements(*)");
       if (error) throw new ApiError(error.message, supabaseErrorStatus(error.code));
       const trips: Trip[] = [];
       for (const row of data ?? []) {
@@ -140,7 +164,7 @@ export const supabaseData = {
     return withDirectSupabase(async () => {
       const { data, error } = await supabase
         .from("trips")
-        .select("*, trip_members(*), expenses(*)")
+        .select("*, trip_members(*), expenses(*), trip_settlements(*)")
         .eq("id", id)
         .maybeSingle();
 
@@ -165,7 +189,7 @@ export const supabaseData = {
           created_by: (await supabase.auth.getUser()).data.user?.id,
           updated_at: new Date(trip.updatedAt).toISOString(),
         }, { onConflict: "id" })
-        .select("*, trip_members(*), expenses(*)")
+        .select("*, trip_members(*), expenses(*), trip_settlements(*)")
         .single();
 
       if (error) throw new ApiError(error.message, supabaseErrorStatus(error.code));
@@ -183,16 +207,34 @@ export const supabaseData = {
         if (result.error) throw new ApiError(result.error.message, supabaseErrorStatus(result.error.code));
       }
       if (trip.expenses.length) {
-        const expenses = trip.expenses.map((expense) => ({
-          id: expense.id, trip_id: trip.id, title: expense.description, description: expense.description,
-          amount: expense.amount, currency: expense.currency, rate_to_base: expense.rateToBase,
-          paid_by: expense.paidBy, created_by: createdBy,
-          category: expense.category, date: expense.date, receipt_data: expense.receipt ?? null,
-          split_definition: expense.split, needs_review: expense.needsReview ?? false,
-          created_at: new Date(expense.createdAt).toISOString(), updated_at: new Date(expense.updatedAt).toISOString(),
-        }));
-        const result = await supabase.from("expenses").upsert(expenses);
-        if (result.error) throw new ApiError(result.error.message, supabaseErrorStatus(result.error.code));
+        for (const expense of trip.expenses) {
+          const result = await supabase.rpc("upsert_expense", {
+            p_expense: {
+              id: expense.id, trip_id: trip.id, title: expense.description, description: expense.description,
+              amount: expense.amount, currency: expense.currency, rate_to_base: expense.rateToBase,
+              paid_by: expense.paidBy, created_by: createdBy, category: expense.category, date: expense.date,
+              receipt_data: expense.receipt ?? null, split_definition: expense.split,
+              needs_review: expense.needsReview ?? false,
+              rate_source: expense.rateSource ?? null,
+              rate_fetched_at: expense.rateFetchedAt ? new Date(expense.rateFetchedAt).toISOString() : null,
+            },
+            p_base_rev: null,
+          });
+          if (result.error) throw new ApiError(result.error.message, supabaseErrorStatus(result.error.code));
+        }
+      }
+      if (trip.settlements?.length) {
+        for (const settlement of trip.settlements) {
+          const result = await supabase.rpc("upsert_settlement", {
+            p_settlement: {
+              id: settlement.id, trip_id: trip.id, from_member: settlement.from, to_member: settlement.to,
+              amount: settlement.amount, currency: settlement.currency, date: settlement.date,
+              method: settlement.method ?? null, note: settlement.note ?? null, created_by: createdBy,
+            },
+            p_base_rev: null,
+          });
+          if (result.error) throw new ApiError(result.error.message, supabaseErrorStatus(result.error.code));
+        }
       }
       const created = await supabaseData.getTrip(trip.id);
       if (!created) throw new ApiError("Trip creation returned no trip", 502);
@@ -242,7 +284,7 @@ export const supabaseData = {
             updated_at: new Date().toISOString(),
           })
           .eq("id", tripId)
-          .select("*, trip_members(*), expenses(*)")
+          .select("*, trip_members(*), expenses(*), trip_settlements(*)")
           .single();
         if (!error) return toTrip(data);
         if (error.code !== "23505") throw new ApiError(error.message, supabaseErrorStatus(error.code));
@@ -253,17 +295,18 @@ export const supabaseData = {
     });
   },
 
-  async patchTrip(id: string, patch: Partial<Pick<Trip, "name" | "baseCurrency">>): Promise<Trip> {
+  async patchTrip(id: string, patch: TripPatch): Promise<Trip> {
     return withDirectSupabase(async () => {
       const { data, error } = await supabase
         .from("trips")
         .update({
           name: patch.name,
           currency: patch.baseCurrency,
+          ...(patch.budget !== undefined ? { budget: patch.budget } : {}),
           updated_at: new Date().toISOString(),
         })
         .eq("id", id)
-        .select("*, trip_members(*), expenses(*)")
+        .select("*, trip_members(*), expenses(*), trip_settlements(*)")
         .single();
 
       if (error) throw new ApiError(error.message, supabaseErrorStatus(error.code));
@@ -322,6 +365,8 @@ export const supabaseData = {
           receipt_data: expense.receipt ?? null,
           split_definition: expense.split,
           needs_review: expense.needsReview ?? false,
+          rate_source: expense.rateSource ?? null,
+          rate_fetched_at: expense.rateFetchedAt ? new Date(expense.rateFetchedAt).toISOString() : null,
           updated_at: new Date(expense.updatedAt).toISOString(),
         },
         p_base_rev: expense.revision ?? null,
@@ -363,6 +408,57 @@ export const supabaseData = {
       return trip;
     }, async () => {
       throw new ApiError("Expense deletion is unavailable", 503);
+    });
+  },
+
+  async upsertSettlement(id: string, settlement: Settlement): Promise<Trip> {
+    return withDirectSupabase(async () => {
+      if (!(settlement.amount > 0) || !Number.isFinite(settlement.amount)) {
+        throw new ApiError("Payment amount must be greater than zero", 400);
+      }
+      const { error } = await supabase.rpc("upsert_settlement", {
+        p_settlement: {
+          id: settlement.id,
+          trip_id: id,
+          from_member: settlement.from,
+          to_member: settlement.to,
+          amount: settlement.amount,
+          currency: settlement.currency,
+          date: settlement.date,
+          method: settlement.method ?? null,
+          note: settlement.note ?? null,
+          updated_at: new Date(settlement.updatedAt).toISOString(),
+        },
+        p_base_rev: settlement.revision ?? null,
+      });
+      if (error) {
+        if (isRevisionConflict(error)) {
+          const latest = await supabaseData.getTrip(id).catch(() => null);
+          const current = latest?.settlements?.find((candidate) => candidate.id === settlement.id) ?? null;
+          throw new ApiError(error.message, 409, false, { code: "settlement_conflict", current });
+        }
+        throw new ApiError(error.message, supabaseErrorStatus(error.code));
+      }
+      const trip = await supabaseData.getTrip(id);
+      if (!trip) throw new ApiError("Trip not found", 404);
+      return trip;
+    }, async () => {
+      throw new ApiError("Payment sync is unavailable", 503);
+    });
+  },
+
+  async deleteSettlement(id: string, settlementId: string): Promise<Trip> {
+    return withDirectSupabase(async () => {
+      const { error } = await supabase.rpc("upsert_settlement", {
+        p_settlement: { id: settlementId, trip_id: id, deleted_at: new Date().toISOString() },
+        p_base_rev: null,
+      });
+      if (error) throw new ApiError(error.message, supabaseErrorStatus(error.code));
+      const trip = await supabaseData.getTrip(id);
+      if (!trip) throw new ApiError("Trip not found", 404);
+      return trip;
+    }, async () => {
+      throw new ApiError("Payment deletion is unavailable", 503);
     });
   },
 };

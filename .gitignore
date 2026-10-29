@@ -4,8 +4,10 @@
 **/.env
 **/.env.*
 
-# Local Supabase schema snapshots / setup files
-supabase/
+# Local Supabase state (the schema itself lives in supabase/)
+.supabase/
+supabase/.temp/
+supabase/.branches/
 
 # Test files are source and should be tracked. Generated reports remain ignored
 # by the build-specific rules below.

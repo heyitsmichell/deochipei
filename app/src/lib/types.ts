@@ -46,7 +46,9 @@ export type Split =
   // Each receipt item is shared by the members listed for it; items nobody
   // claimed are shared by everyone in `memberIds`. Tax, tip and anything not
   // itemised is spread in proportion to what each person ordered.
-  | { type: "items"; memberIds: string[]; assignments: Record<number, string[]> };
+  | { type: "items"; memberIds: string[]; assignments: Record<number, string[]> }
+  // Weighted split, e.g. an adult counts as 2 shares and a child as 1.
+  | { type: "shares"; memberIds: string[]; weights: Record<string, number> };
 
 export interface Expense {
   id: string;
@@ -67,11 +69,36 @@ export interface Expense {
   needsReview?: boolean;
   createdAt: number;
   updatedAt: number;
+  /** Which rate feed (or "Custom rate") the locked exchange rate came from. */
+  rateSource?: string;
+  /** When the locked rate was fetched, so the source and age can be shown. */
+  rateFetchedAt?: number;
   /**
    * Server-owned version of this expense. An edit sends back the revision it
    * started from so the server can refuse it if someone else saved in between.
    * Never set on the device; absent for expenses the server hasn't seen yet.
    */
+  revision?: number;
+}
+
+/**
+ * A payment that has actually happened between two members. Amounts are in the
+ * trip's base currency. Settlements reduce balances but never count as spending.
+ */
+export interface Settlement {
+  id: string;
+  /** The member who paid. */
+  from: string;
+  /** The member who received the money. */
+  to: string;
+  amount: number;
+  currency: string;
+  date: string;
+  method?: string;
+  note?: string;
+  createdBy?: string;
+  createdAt: number;
+  updatedAt: number;
   revision?: number;
 }
 
@@ -81,9 +108,14 @@ export interface Trip {
   inviteCode?: string;
   name: string;
   baseCurrency: string;
+  /** Optional spending cap for the whole trip, in the base currency. */
+  budget?: number;
   members: Member[];
   expenses: Expense[];
+  /** Payments recorded between members; see Settlement and Ledger. */
+  settlements?: Settlement[];
   deletedExpenseIds: string[];
+  deletedSettlementIds?: string[];
   updatedAt: number;
   ownerId?: string;
   /** True for trips created/joined through a server; guest trips stay local. */
@@ -92,6 +124,11 @@ export interface Trip {
   revision?: number;
   inviteExpiresAt?: number | string | null;
 }
+
+/** Fields a client may change on an existing trip. `null` clears the budget. */
+export type TripPatch = Partial<Pick<Trip, "name" | "baseCurrency">> & {
+  budget?: number | null;
+};
 
 /** An invite lookup exposes names only and must never replace an account's full trip. */
 export interface TripPreview {

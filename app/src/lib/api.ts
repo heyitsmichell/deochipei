@@ -3,7 +3,7 @@ import type { DuplicateCheckRequest, DuplicateVerdict } from "./duplicates";
 import { ApiError } from "./errors";
 import { supabaseData } from "./supabaseData";
 import { supabase } from "./supabase";
-import type { Expense, Member, ReceiptScan, Trip, TripLookup } from "./types";
+import type { Expense, Member, ReceiptScan, Settlement, Trip, TripLookup, TripPatch } from "./types";
 
 const API_PORT = 4000;
 
@@ -89,7 +89,7 @@ const legacyApi = {
   }),
   regenerateTripInvite: (tripId: string) =>
     request<Trip>(`/api/trips/${tripId}/regenerate-invite`, { method: "POST" }),
-  patchTrip: (id: string, patch: Partial<Pick<Trip, "name" | "baseCurrency">>) =>
+  patchTrip: (id: string, patch: TripPatch) =>
     request<Trip>(`/api/trips/${id}`, { method: "PATCH", body: JSON.stringify(patch) }),
   upsertMember: (id: string, m: Member) => request<Trip>(`/api/trips/${id}/members/${m.id}`, put(m)),
   // `revision` is what this edit started from; the server refuses the write (409) if it has moved on.
@@ -99,6 +99,15 @@ const legacyApi = {
   },
   deleteExpense: (id: string, expenseId: string) =>
     request<Trip>(`/api/trips/${id}/expenses/${expenseId}`, { method: "DELETE" }),
+  upsertSettlement: (id: string, settlement: Settlement) => {
+    const { revision, ...rest } = settlement;
+    return request<Trip>(
+      `/api/trips/${id}/settlements/${settlement.id}`,
+      put(revision != null ? { ...rest, baseRevision: revision } : rest),
+    );
+  },
+  deleteSettlement: (id: string, settlementId: string) =>
+    request<Trip>(`/api/trips/${id}/settlements/${settlementId}`, { method: "DELETE" }),
   scanReceipt: (imageBase64: string, targetLanguage: string) =>
     request<ReceiptScan>("/api/scan-receipt", {
       method: "POST",
@@ -131,6 +140,8 @@ export const api = useDirectSupabase
       upsertMember: supabaseData.upsertMember,
       upsertExpense: supabaseData.upsertExpense,
       deleteExpense: supabaseData.deleteExpense,
+      upsertSettlement: supabaseData.upsertSettlement,
+      deleteSettlement: supabaseData.deleteSettlement,
       scanReceipt: legacyApi.scanReceipt,
       checkDuplicate: legacyApi.checkDuplicate,
     }

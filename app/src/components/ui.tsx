@@ -29,6 +29,8 @@ export function Button({
   loading,
   disabled,
   style,
+  accessibilityLabel,
+  accessibilityHint,
 }: {
   title: string;
   onPress: () => void;
@@ -36,12 +38,17 @@ export function Button({
   loading?: boolean;
   disabled?: boolean;
   style?: StyleProp<ViewStyle>;
+  accessibilityLabel?: string;
+  accessibilityHint?: string;
 }) {
   const { styles, buttons } = useTheme();
   const v = buttons[variant];
   return (
     <Pressable
       accessibilityRole="button"
+      accessibilityLabel={accessibilityLabel ?? title}
+      accessibilityHint={accessibilityHint}
+      accessibilityState={{ disabled: Boolean(disabled || loading), busy: Boolean(loading) }}
       onPress={onPress}
       disabled={disabled || loading}
       style={({ pressed }) => [
@@ -74,7 +81,7 @@ export function Field({ label, ...props }: TextInputProps & { label: string }) {
   return (
     <View style={{ marginBottom: 14 }}>
       <Label>{label}</Label>
-      <Input {...props} />
+      <Input accessibilityLabel={props.accessibilityLabel ?? label} {...props} />
     </View>
   );
 }
@@ -84,10 +91,29 @@ export function Label({ children }: { children: ReactNode }) {
   return <Text style={styles.label}>{children}</Text>;
 }
 
-export function Chip({ label, selected, onPress }: { label: string; selected: boolean; onPress: () => void }) {
+export function Chip({
+  label,
+  selected,
+  onPress,
+  accessibilityLabel,
+  accessibilityHint,
+}: {
+  label: string;
+  selected: boolean;
+  onPress: () => void;
+  accessibilityLabel?: string;
+  accessibilityHint?: string;
+}) {
   const { colors, styles } = useTheme();
   return (
-    <Pressable onPress={onPress} style={[styles.chip, selected && styles.chipSelected]}>
+    <Pressable
+      accessibilityRole="button"
+      accessibilityLabel={accessibilityLabel ?? label}
+      accessibilityHint={accessibilityHint}
+      accessibilityState={{ selected }}
+      onPress={onPress}
+      style={[styles.chip, selected && styles.chipSelected]}
+    >
       <Text style={{ color: selected ? colors.onPrimary : colors.text, fontWeight: "500" }}>{label}</Text>
     </Pressable>
   );

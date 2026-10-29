@@ -1,11 +1,9 @@
 import { createClient, type SupabaseClient, type User } from "@supabase/supabase-js";
 import type { Request, Response, NextFunction } from "express";
 
-declare global {
-  namespace Express {
-    interface Request {
-      user?: User;
-    }
+declare module "express-serve-static-core" {
+  interface Request {
+    user?: User;
   }
 }
 
@@ -14,12 +12,19 @@ if (typeof (globalThis as unknown as { WebSocket?: unknown }).WebSocket === "und
   (globalThis as unknown as { WebSocket: unknown }).WebSocket = class WebSocket {};
 }
 
+type AuthUserLike = Pick<User, "id"> & Partial<Pick<User, "email" | "user_metadata">>;
+type AuthClientLike = {
+  auth: {
+    getUser(token: string): Promise<{ data: { user: AuthUserLike | null }; error: unknown }>;
+  };
+};
+
 let supabaseInstance: SupabaseClient | null = null;
 let lastUrl: string | undefined = undefined;
 let lastKey: string | undefined = undefined;
-let testSupabaseClient: any = null;
+let testSupabaseClient: AuthClientLike | null = null;
 
-export function setSupabaseClientForTesting(client: any): void {
+export function setSupabaseClientForTesting(client: AuthClientLike | null): void {
   testSupabaseClient = client;
 }
 

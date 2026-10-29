@@ -118,3 +118,72 @@ test("malformed receipt item lists require repair without discarding their origi
   assert.equal(receiptItemsNeedRepair(receipt), false);
   assert.deepEqual(normalizeReceiptQuantities(receipt), receipt);
 });
+
+test("weighted shares split in proportion and conserve every cent", () => {
+  const weighted = expense({
+    amount: 10,
+    split: { type: "shares", memberIds: ["a", "b"], weights: { a: 2, b: 1 } },
+  });
+  assert.deepEqual(computeShares(weighted), { a: 6.67, b: 3.33 });
+  const adultsAndChild = expense({
+    amount: 100,
+    split: { type: "shares", memberIds: ["a", "b", "c"], weights: { a: 2, b: 1, c: 1 } },
+  });
+  assert.deepEqual(computeShares(adultsAndChild), { a: 50, b: 25, c: 25 });
+  // A zero or missing weight means that person pays nothing, and the total is
+  // never lost to the people who do pay.
+  const onePayer = expense({ amount: 9, split: { type: "shares", memberIds: ["a", "b"], weights: { a: 3, b: 0 } } });
+  assert.deepEqual(computeShares(onePayer), { a: 9, b: 0 });
+  const ledger = new Ledger(trip({ expenses: [weighted] }));
+  assert.equal(ledger.balances().reduce((sum, balance) => sum + balance.net, 0), 0);
+});
+
+test("recorded payments reduce balances and leave spending unchanged", () => {
+  const e = expense({ amount: 10 });
+  const settlement = { id: "pay", from: "b", to: "a", amount: 5, currency: "USD",
+    date: "2026-10-29", createdAt: 2, updatedAt: 2 };
+  const ledger = new Ledger(trip({ expenses: [e], settlements: [settlement] }));
+  assert.equal(ledger.totalSpent, 10);
+  assert.equal(ledger.totalSettled, 5);
+  assert.deepEqual(ledger.settlementPlan().transfers, []);
+  assert.deepEqual(ledger.settlementPlan().direct, []);
+  assert.deepEqual(ledger.balanceOf("b"), {
+    memberId: "b", paid: 0, owed: 5, settledOut: 5, settledIn: 0, net: 0,
+  });
+  assert.deepEqual(ledger.balanceOf("a"), {
+    memberId: "a", paid: 10, owed: 5, settledOut: 0, settledIn: 5, net: 0,
+  });
+});
+
+test("an overpayment flips the remaining debt to the other person", () => {
+  const e = expense({ amount: 10 });
+  const overpaid = { id: "pay", from: "b", to: "a", amount: 8, currency: "USD",
+    date: "2026-10-29", createdAt: 2, updatedAt: 2 };
+  const ledger = new Ledger(trip({ expenses: [e], settlements: [overpaid] }));
+  assert.equal(ledger.balanceOf("b").net, 3);
+  assert.equal(ledger.balanceOf("a").net, -3);
+  assert.deepEqual(ledger.settlementPlan().transfers, [{ from: "a", to: "b", amount: 3 }]);
+  assert.deepEqual(ledger.settlementPlan().direct, [{ from: "a", to: "b", amount: 3 }]);
+});
+
+test("damaged payments are identified without breaking the rest of the ledger", () => {
+  const good = { id: "good", from: "b", to: "a", amount: 1, currency: "USD",
+    date: "2026-10-29", createdAt: 1, updatedAt: 1 };
+  for (const bad of [
+    { ...good, id: "bad", amount: 0 },
+    { ...good, id: "bad", amount: -2 },
+    { ...good, id: "bad", amount: Infinity },
+    { ...good, id: "bad", from: "b", to: "b" },
+    { ...good, id: "bad", currency: "EUR" },
+    { ...good, id: "bad", date: "2026-02-30" },
+    { ...good, id: "bad", from: "" },
+    null,
+  ]) {
+    const result = inspectLedger(trip({ expenses: [expense()], settlements: [good, bad as never] }));
+    assert.equal(result.ledger, undefined);
+    assert.equal(result.invalid.length, 1);
+    assert.equal(result.invalid[0].kind, "settlement");
+    assert.equal(result.invalid[0].value, bad);
+  }
+  assert.ok(inspectLedger(trip({ settlements: [good] })).ledger);
+});

@@ -4,19 +4,13 @@ import { isInviteExpired } from "../lib/invite";
 import { inspectLedger } from "../lib/ledger";
 import { receiptItemsNeedRepair } from "../lib/receiptScan";
 import { CoalescedWriter, type KeyValueStorage } from "../lib/storage";
-import { isTripPreview, newId, type TripLookup, type Expense, type Member, type ThemePreference, type Trip } from "../lib/types";
+import { isTripPreview, newId, type TripLookup, type Expense, type Member, type Settlement, type ThemePreference, type Trip } from "../lib/types";
+import { planAccountTransition } from "./accountTransitions";
+import { applyOp, type Op, type TripPatch } from "./tripOps";
 
 export type TripApi = typeof defaultApi;
-export type TripPatch = Partial<Pick<Trip, "name" | "baseCurrency">>;
-
-/** A change made on this device that the server hasn't confirmed yet. */
-type OpMeta = { attempts?: number; retryAt?: number; recovered?: boolean };
-export type Op =
-  | ({ kind: "createTrip"; tripId: string } & OpMeta)
-  | ({ kind: "patchTrip"; tripId: string; patch: TripPatch } & OpMeta)
-  | ({ kind: "upsertMember"; tripId: string; member: Member } & OpMeta)
-  | ({ kind: "upsertExpense"; tripId: string; expense: Expense } & OpMeta)
-  | ({ kind: "deleteExpense"; tripId: string; expenseId: string } & OpMeta);
+export type { Op, TripPatch } from "./tripOps";
+export { applyOp } from "./tripOps";
 
 /**
  * An edit made here that the server refused because someone else changed (or
@@ -74,32 +68,6 @@ const EMPTY: PersistedData = {
   settings: { receiptLanguage: "English", scanQueuedOnCellular: false, appearance: "system" },
 };
 
-export function applyOp(trip: Trip, op: Op): Trip {
-  switch (op.kind) {
-    case "createTrip":
-      return trip;
-    case "patchTrip":
-      return { ...trip, ...op.patch };
-    case "upsertMember":
-      return { ...trip, members: upsertById(trip.members, op.member) };
-    case "upsertExpense":
-      return { ...trip, expenses: upsertById(trip.expenses, op.expense) };
-    case "deleteExpense":
-      return {
-        ...trip,
-        expenses: trip.expenses.filter((e) => e?.id !== op.expenseId),
-        deletedExpenseIds: trip.deletedExpenseIds.includes(op.expenseId)
-          ? trip.deletedExpenseIds
-          : [...trip.deletedExpenseIds, op.expenseId],
-      };
-  }
-}
-
-function upsertById<T extends { id: string }>(list: T[], item: T): T[] {
-  const i = list.findIndex((x) => x?.id === item.id);
-  return i === -1 ? [...list, item] : list.map((x, j) => (j === i ? item : x));
-}
-
 /**
  * Offline-first store for trips, independent of React.
  *
@@ -139,31 +107,16 @@ export class TripRepository {
     const transition = this.accountTransition.catch(() => {}).then(async () => {
       await this.ready();
       if (request !== this.accountRequest) return;
-      const cachedAccount = this.data.accountId;
       let cleanupError: unknown;
       let cleanupFailed = false;
-      if (cachedAccount === undefined) {
+      const plan = planAccountTransition(this.data, id);
+      if (plan.kind === "migrate") {
         // Keep verifiable trips active. Retain uncertain legacy work separately
         // until the server confirms access, without sending it as another user.
-        const uncertain = new Set(Object.values(this.data.trips).filter((trip) => trip.syncEnabled &&
-          (!id || (trip.ownerId !== id && !trip.members.some((member) => member.userId === id)))).map((trip) => trip.id));
-        if (uncertain.size) {
-          this.update((data) => ({ ...data,
-            unverified: {
-              trips: { ...data.unverified?.trips, ...Object.fromEntries(Object.entries(data.trips).filter(([tripId]) => uncertain.has(tripId))) },
-              ops: [...(data.unverified?.ops ?? []), ...data.ops.filter((op) => uncertain.has(op.tripId))],
-              failedOps: [...(data.unverified?.failedOps ?? []), ...data.failedOps.filter((op) => uncertain.has(op.tripId))],
-              me: { ...data.unverified?.me, ...Object.fromEntries(Object.entries(data.me).filter(([tripId]) => uncertain.has(tripId))) },
-            },
-            trips: Object.fromEntries(Object.entries(data.trips).filter(([tripId]) => !uncertain.has(tripId))),
-            ops: data.ops.filter((op) => !uncertain.has(op.tripId)),
-            failedOps: data.failedOps.filter((op) => !uncertain.has(op.tripId)),
-            me: Object.fromEntries(Object.entries(data.me).filter(([tripId]) => !uncertain.has(tripId))),
-          }));
-          try { await beforeReset("migrate"); }
-          catch (error) { cleanupError = error; cleanupFailed = true; }
-        }
-      } else if (cachedAccount !== id) {
+        this.update((data) => ({ ...data, ...plan.data }));
+        try { await beforeReset("migrate"); }
+        catch (error) { cleanupError = error; cleanupFailed = true; }
+      } else if (plan.kind === "reset") {
         try { await beforeReset("reset"); }
         catch (error) { cleanupError = error; cleanupFailed = true; }
         if (request !== this.accountRequest) return;
@@ -367,7 +320,9 @@ export class TripRepository {
       baseCurrency: input.baseCurrency,
       members,
       expenses: [],
+      settlements: [],
       deletedExpenseIds: [],
+      deletedSettlementIds: [],
       updatedAt: Date.now(),
       ...(input.ownerId ? { ownerId: input.ownerId } : {}),
       ...(input.ownerId ? { syncEnabled: true } : {}),
@@ -517,11 +472,28 @@ export class TripRepository {
 
   patchTrip = (tripId: string, patch: TripPatch) => {
     if (patch.name !== undefined && !patch.name.trim()) throw new ApiError("Trip name cannot be empty.", 400);
+    if (
+      patch.budget !== undefined &&
+      patch.budget !== null &&
+      (!Number.isFinite(patch.budget) || patch.budget <= 0)
+    ) {
+      throw new ApiError("Trip budget must be greater than zero.", 400);
+    }
+    const trip = this.data.trips[tripId];
+    if (
+      trip &&
+      patch.baseCurrency !== undefined &&
+      patch.baseCurrency !== trip.baseCurrency &&
+      (trip.settlements ?? []).some((settlement) =>
+        !(settlement?.id && (trip.deletedSettlementIds ?? []).includes(settlement.id)))
+    ) {
+      throw new ApiError("A trip's base currency cannot change while it has recorded settlements.", 409);
+    }
     const normalized = {
       ...(patch.name !== undefined ? { name: patch.name.trim().slice(0, 80) } : {}),
       ...(patch.baseCurrency !== undefined ? { baseCurrency: patch.baseCurrency } : {}),
+      ...(patch.budget !== undefined ? { budget: patch.budget } : {}),
     };
-    const trip = this.data.trips[tripId];
     if (!trip) return;
     this.update((d) => ({ ...d, trips: { ...d.trips, [tripId]: applyOp(trip, { kind: "patchTrip", tripId, patch: normalized }) } }));
     if (trip.syncEnabled) this.enqueue({ kind: "patchTrip", tripId, patch: normalized });
@@ -561,6 +533,48 @@ export class TripRepository {
     if (!trip) return;
     this.update((d) => ({ ...d, trips: { ...d.trips, [tripId]: applyOp(trip, { kind: "deleteExpense", tripId, expenseId }) } }));
     if (trip.syncEnabled) this.enqueue({ kind: "deleteExpense", tripId, expenseId });
+  };
+
+  saveSettlement = (tripId: string, settlement: Settlement) => {
+    const trip = this.data.trips[tripId];
+    if (!trip) return;
+    const updated = { ...settlement, updatedAt: Date.now() };
+    this.update((d) => ({
+      ...d,
+      trips: { ...d.trips, [tripId]: applyOp(trip, { kind: "upsertSettlement", tripId, settlement: updated }) },
+    }));
+    if (trip.syncEnabled) this.enqueue({ kind: "upsertSettlement", tripId, settlement: updated });
+  };
+
+  deleteSettlement = (tripId: string, settlementId: string) => {
+    const trip = this.data.trips[tripId];
+    if (!trip) return;
+    this.update((d) => ({
+      ...d,
+      trips: { ...d.trips, [tripId]: applyOp(trip, { kind: "deleteSettlement", tripId, settlementId }) },
+    }));
+    if (trip.syncEnabled) this.enqueue({ kind: "deleteSettlement", tripId, settlementId });
+  };
+
+  removeDamagedSettlement = (tripId: string, index: number, expected: unknown) => {
+    const trip = this.data.trips[tripId];
+    if (!trip || !Array.isArray(trip.settlements) || index < 0 || index >= trip.settlements.length ||
+        trip.settlements[index] !== expected) {
+      throw new Error("The payment list changed. Review the damaged entry again.");
+    }
+    if (trip.settlements[index]?.id) {
+      return this.deleteSettlement(tripId, trip.settlements[index].id);
+    }
+    this.update((data) => ({
+      ...data,
+      trips: {
+        ...data.trips,
+        [tripId]: {
+          ...trip,
+          settlements: trip.settlements?.filter((_, position) => position !== index),
+        },
+      },
+    }));
   };
 
   /** Confirmed repair restores intact server data before considering shared deletion. */
@@ -746,7 +760,12 @@ export class TripRepository {
         const trips = Object.fromEntries(
           Object.entries(saved.trips ?? {}).map(([id, trip]) => [
             id,
-            { ...trip, syncEnabled: trip.syncEnabled ?? Boolean(trip.ownerId) },
+            {
+              ...trip,
+              syncEnabled: trip.syncEnabled ?? Boolean(trip.ownerId),
+              settlements: Array.isArray(trip.settlements) ? trip.settlements : [],
+              deletedSettlementIds: Array.isArray(trip.deletedSettlementIds) ? trip.deletedSettlementIds : [],
+            },
           ]),
         );
         this.snapshot = {
@@ -824,6 +843,10 @@ export class TripRepository {
         return this.api.upsertExpense(op.tripId, op.expense);
       case "deleteExpense":
         return this.api.deleteExpense(op.tripId, op.expenseId);
+      case "upsertSettlement":
+        return this.api.upsertSettlement(op.tripId, op.settlement);
+      case "deleteSettlement":
+        return this.api.deleteSettlement(op.tripId, op.settlementId);
     }
   }
 
@@ -927,7 +950,9 @@ export class TripRepository {
       const merged = pending.reduce(applyOp, {
         ...server,
         syncEnabled: true,
+        settlements: server.settlements ?? [],
         deletedExpenseIds: server.deletedExpenseIds ?? [],
+        deletedSettlementIds: server.deletedSettlementIds ?? [],
       });
       return { ...d, trips: { ...d.trips, [server.id]: merged } };
     });

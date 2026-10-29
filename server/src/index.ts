@@ -2,7 +2,7 @@ import express, { type NextFunction, type Request, type Response } from "express
 import path from "node:path";
 import OpenAI from "openai";
 import { z } from "zod";
-import { ExpenseSchema } from "./expense.js";
+import { ExpenseSchema, SettlementSchema } from "./expense.js";
 import { requireAuth } from "./auth.js";
 import { allowedOrigin } from "./cors.js";
 import { DuplicateCheckSchema, judgeDuplicate } from "./duplicates.js";
@@ -10,7 +10,16 @@ import { androidAssetLinks, appleAppSiteAssociation, invitePage, isValidInviteCo
 import { NimNotConfiguredError } from "./nim.js";
 import { parseTrustProxy, RateLimiter } from "./ratelimit.js";
 import { NotAReceiptError, ScanRefusedError, scanReceipt } from "./receipt.js";
-import { canEditExpense, ExpenseConflictError, TripStore, type Trip } from "./store.js";
+import { parseDailyScanLimit, ScanStore } from "./scanCache.js";
+import {
+  BaseCurrencySettlementError,
+  canEditExpense,
+  canEditSettlement,
+  ExpenseConflictError,
+  SettlementConflictError,
+  TripStore,
+  type Trip,
+} from "./store.js";
 
 // DATA_DIR must be on a persistent volume in production. An old trips.json in it is imported once.
 const dbFile = path.resolve(process.env.DATA_DIR ?? "data", "trips.db");
@@ -49,6 +58,11 @@ const smallJson = express.json({ limit: "256kb" });
 // Rate limits live in the same SQLite file as the trips, so they survive restarts
 // and are shared by every server process on that volume.
 const rateLimiter = new RateLimiter(dbFile);
+
+// Receipt scans are the expensive AI call. Cache successful scans by image hash
+// and cap each account's paid scans per UTC day; both survive restarts.
+const scanStore = new ScanStore(dbFile);
+const dailyScanLimit = parseDailyScanLimit();
 
 export function createRateLimiter(options: {
   bucket: string;
@@ -169,6 +183,7 @@ app.post("/api/trips", requireAuth, async (req: Request, res: Response) => {
       baseCurrency: CurrencySchema,
       members: z.array(MemberSchema).min(1),
       expenses: z.array(ExpenseSchema).default([]),
+      settlements: z.array(SettlementSchema).default([]),
     })
     .safeParse(req.body);
   if (!body.success) return res.status(400).json({ error: body.error.message });
@@ -214,7 +229,7 @@ app.post("/api/trips/:id/regenerate-invite", requireAuth, async (req: Request, r
   try {
     const updated = await store.regenerateInvite(id);
     return res.json(updated);
-  } catch (err) {
+  } catch {
     return res.status(500).json({ error: "Failed to regenerate invite" });
   }
 });
@@ -270,7 +285,11 @@ app.post("/api/join/:code", joinRateLimiter, requireAuth, smallJson, async (req:
 
 app.patch("/api/trips/:id", requireAuth, async (req: Request, res: Response) => {
   const body = z
-    .object({ name: z.string().min(1).max(80).optional(), baseCurrency: CurrencySchema.optional() })
+    .object({
+      name: z.string().min(1).max(80).optional(),
+      baseCurrency: CurrencySchema.optional(),
+      budget: z.number().positive().max(1_000_000_000).nullable().optional(),
+    })
     .safeParse(req.body);
   if (!body.success) return res.status(400).json({ error: body.error.message });
 
@@ -283,7 +302,13 @@ app.patch("/api/trips/:id", requireAuth, async (req: Request, res: Response) => 
     return res.status(403).json({ error: "Only the trip owner can update the trip" });
   }
 
-  const updated = await store.update(id, body.data);
+  let updated: Trip | undefined;
+  try {
+    updated = await store.update(id, body.data);
+  } catch (error) {
+    if (error instanceof BaseCurrencySettlementError) return res.status(409).json({ error: error.message });
+    throw error;
+  }
   return updated ? res.json(updated) : notFound(res);
 });
 
@@ -391,6 +416,62 @@ app.delete("/api/trips/:id/expenses/:expenseId", requireAuth, async (req: Reques
   return updated ? res.json(updated) : notFound(res);
 });
 
+app.put("/api/trips/:id/settlements/:settlementId", requireAuth, async (req: Request, res: Response) => {
+  const settlementId = extractParam(req.params.settlementId);
+  const body = SettlementSchema.safeParse({ ...req.body, id: settlementId });
+  if (!body.success) return res.status(400).json({ error: body.error.message });
+  const base = z.number().int().min(0).optional().safeParse(req.body?.baseRevision);
+  if (!base.success) return res.status(400).json({ error: "baseRevision must be a non-negative integer" });
+
+  const id = extractParam(req.params.id);
+  const trip = store.get(id);
+  if (!trip) return notFound(res);
+  const isMember = trip.ownerId === req.user!.id || trip.members.some((m) => m.userId === req.user!.id);
+  if (!isMember) return res.status(403).json({ error: "Not a member of this trip" });
+  if (body.data.currency !== trip.baseCurrency) {
+    return res.status(400).json({ error: `Payments are recorded in ${trip.baseCurrency}` });
+  }
+  if (!trip.members.some((m) => m.id === body.data.from) || !trip.members.some((m) => m.id === body.data.to)) {
+    return res.status(400).json({ error: "Both people must be members of this trip" });
+  }
+
+  const existing = (trip.settlements ?? []).find((settlement) => settlement.id === settlementId);
+  if (!canEditSettlement(trip, req.user!.id, existing)) {
+    return res.status(403).json({ error: "Only the person who recorded this payment or the trip owner can change it" });
+  }
+  body.data.createdBy = typeof existing?.createdBy === "string" ? existing.createdBy : req.user!.id;
+  delete (body.data as Record<string, unknown>).revision;
+
+  try {
+    const updated = await store.upsertSettlement(id, body.data, base.data);
+    return updated ? res.json(updated) : res.status(400).json({ error: "Invalid payment" });
+  } catch (err) {
+    if (err instanceof SettlementConflictError) {
+      return res.status(409).json({
+        error: err.message,
+        code: "settlement_conflict",
+        current: err.current ?? null,
+      });
+    }
+    throw err;
+  }
+});
+
+app.delete("/api/trips/:id/settlements/:settlementId", requireAuth, async (req: Request, res: Response) => {
+  const id = extractParam(req.params.id);
+  const settlementId = extractParam(req.params.settlementId);
+  const trip = store.get(id);
+  if (!trip) return notFound(res);
+  const isMember = trip.ownerId === req.user!.id || trip.members.some((m) => m.userId === req.user!.id);
+  if (!isMember) return res.status(403).json({ error: "Not a member of this trip" });
+  const existing = (trip.settlements ?? []).find((settlement) => settlement.id === settlementId);
+  if (!canEditSettlement(trip, req.user!.id, existing)) {
+    return res.status(403).json({ error: "Only the person who recorded this payment or the trip owner can remove it" });
+  }
+  const updated = await store.deleteSettlement(id, settlementId);
+  return updated ? res.json(updated) : notFound(res);
+});
+
 // Invite links: the page a phone camera opens from a trip's QR code, plus the
 // files iOS and Android check before opening such links in the app directly.
 app.get("/join/:code", joinRateLimiter, (req, res) => {
@@ -428,7 +509,29 @@ async function handleScanReceipt(req: Request, res: Response) {
   }
 
   try {
-    res.json(await scanReceipt(body.data));
+    const key = scanStore.cacheKey(body.data.imageBase64, body.data.targetLanguage);
+    const cached = scanStore.cached(key);
+    if (cached) {
+      res.setHeader("X-Scan-Cache", "hit");
+      return res.json(cached);
+    }
+
+    // Only a scan that will actually call the model consumes the daily allowance.
+    const quota = scanStore.consumeDaily(req.user!.id, dailyScanLimit);
+    if (!quota.allowed) {
+      res.setHeader("Retry-After", String(quota.retryAfterSec));
+      return res.status(429).json({
+        error: `You've used today's ${quota.limit} receipt scans. Try again tomorrow, or reuse a photo that already scanned.`,
+        code: "scan_quota_exceeded",
+        used: quota.used,
+        limit: quota.limit,
+      });
+    }
+
+    const scan = await scanReceipt(body.data);
+    scanStore.remember(key, scan);
+    res.setHeader("X-Scan-Cache", "miss");
+    res.json(scan);
   } catch (err) {
     sendNIMError(res, err);
   }
@@ -518,7 +621,7 @@ app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
   res.status(500).json({ error: "Internal server error" });
 });
 
-export { app, store, rateLimiter };
+export { app, store, rateLimiter, scanStore };
 
 const port = Number(process.env.PORT ?? 4000);
 await store.load();
@@ -538,12 +641,14 @@ if (process.env.NODE_ENV !== "test") {
     const force = setTimeout(() => {
       store.close();
       rateLimiter.close();
+      scanStore.close();
       process.exit(1);
     }, 10_000);
     force.unref();
     server.close(() => {
       store.close();
       rateLimiter.close();
+      scanStore.close();
       process.exit(0);
     });
     server.closeIdleConnections();

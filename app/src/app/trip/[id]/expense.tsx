@@ -1,20 +1,23 @@
 import { Alert } from "../../../lib/alert";
 import { router, Stack, useLocalSearchParams } from "expo-router";
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Image,
-  Pressable,
   ScrollView,
-  StyleSheet,
   Text,
   View,
 } from "react-native";
 import { describeExpense } from "../../../components/ExpenseConflicts";
+import { RateField } from "../../../components/expense/RateField";
+import { ReceiptItems } from "../../../components/expense/ReceiptItems";
+import { ShareWeights } from "../../../components/expense/ShareWeights";
+import { ItemizedShareBreakdown, ShareSummary } from "../../../components/expense/SplitPreview";
 import { Banner, Button, Card, Chip, CurrencyPicker, Field, Input, Label, useTheme } from "../../../components/ui";
 import { api, ApiError } from "../../../lib/api";
 import { findDuplicate, type DuplicateMatch } from "../../../lib/duplicates";
-import { formatMoney, fromMinor, parseAmount, parseRate, toMinor } from "../../../lib/money";
+import { createExpenseRecord } from "../../../lib/expenseDraft";
+import { formatMoney, parseAmount, parseRate } from "../../../lib/money";
 import { describeAge, rateService } from "../../../lib/rates";
 import { pickReceiptImage, type ImageSource } from "../../../lib/receiptImage";
 import { isCurrencyCode, isISODate, normalizeReceiptQuantities, receiptFromScan, receiptItemsNeedRepair } from "../../../lib/receiptScan";
@@ -25,7 +28,6 @@ import {
   todayISO,
   type Category,
   type Expense,
-  type Member,
   type ReceiptData,
   type ReceiptItem,
   type ReceiptScan,
@@ -122,6 +124,8 @@ function ExpenseEditor({ trip, expenseId, scan, queuedId }: Params & { trip: Tri
   const [currency, setCurrency] = useState(existing?.currency ?? lastCurrency ?? trip.baseCurrency);
   const [rateText, setRateText] = useState(existing ? String(existing.rateToBase) : "");
   const [rateInfo, setRateInfo] = useState<string | null>(null);
+  const [rateSource, setRateSource] = useState<string | undefined>(existing?.rateSource);
+  const [rateFetchedAt, setRateFetchedAt] = useState<number | undefined>(existing?.rateFetchedAt);
   const [liveRate, setLiveRate] = useState<number | null>(null);
   const [rateLoading, setRateLoading] = useState(false);
   const [rateEdited, setRateEdited] = useState(!!existing);
@@ -135,6 +139,9 @@ function ExpenseEditor({ trip, expenseId, scan, queuedId }: Params & { trip: Tri
   const [date, setDate] = useState(existing?.date ?? queued?.capturedOn ?? todayISO());
   const [splitType, setSplitType] = useState<Split["type"]>(existing?.split?.type ?? "equal");
   const [memberIds, setMemberIds] = useState<string[]>(existing?.split?.memberIds ?? queued?.memberIds ?? allIds);
+  const [weights, setWeights] = useState<Record<string, number>>(
+    existing?.split?.type === "shares" && existing.split.weights ? existing.split.weights : {},
+  );
   const [assignments, setAssignments] = useState<Record<number, string[]>>(
     existing?.split?.type === "items" && existing.split.assignments ? existing.split.assignments : {},
   );
@@ -169,6 +176,8 @@ function ExpenseEditor({ trip, expenseId, scan, queuedId }: Params & { trip: Tri
       setRateText("1");
       setLiveRate(1);
       setRateInfo(null);
+      setRateSource("Base currency");
+      setRateFetchedAt(undefined);
       setRateLoading(false);
       return;
     }
@@ -179,9 +188,15 @@ function ExpenseEditor({ trip, expenseId, scan, queuedId }: Params & { trip: Tri
       setRateText(String(Number(rate.toPrecision(6))));
       setLiveRate(rate);
       setRateInfo(table ? `Live rate · ${table.source} · updated ${describeAge(table.fetchedAt)}` : null);
+      setRateSource(table?.source ?? "Live rate");
+      setRateFetchedAt(table?.fetchedAt);
       setRateEdited(false);
     } catch {
-      if (request === rateRequest.current) setRateInfo("Couldn't fetch a live rate — enter one manually.");
+      if (request === rateRequest.current) {
+        setRateInfo("Couldn't fetch a live rate — enter one manually.");
+        setRateSource(undefined);
+        setRateFetchedAt(undefined);
+      }
     } finally {
       if (request === rateRequest.current) setRateLoading(false);
     }
@@ -203,6 +218,8 @@ function ExpenseEditor({ trip, expenseId, scan, queuedId }: Params & { trip: Tri
     setRateText("");
     setLiveRate(null);
     setRateInfo(null);
+    setRateSource(undefined);
+    setRateFetchedAt(undefined);
     setRateLoading(code !== trip.baseCurrency);
     setCurrency(code);
   };
@@ -382,8 +399,14 @@ function ExpenseEditor({ trip, expenseId, scan, queuedId }: Params & { trip: Tri
     () =>
       splitType === "items" && (receipt?.items.length ?? 0) > 0
         ? { type: "items", memberIds, assignments }
-        : { type: "equal", memberIds },
-    [splitType, receipt, memberIds, assignments],
+        : splitType === "shares"
+          ? {
+              type: "shares",
+              memberIds,
+              weights: Object.fromEntries(memberIds.map((memberId) => [memberId, weights[memberId] ?? 1])),
+            }
+          : { type: "equal", memberIds },
+    [splitType, receipt, memberIds, assignments, weights],
   );
 
   const effectiveReceipt = useMemo<ReceiptData | undefined>(() => {
@@ -448,6 +471,8 @@ function ExpenseEditor({ trip, expenseId, scan, queuedId }: Params & { trip: Tri
         date,
         split,
         receipt: effectiveReceipt,
+        rateSource,
+        rateFetchedAt,
       });
       // Someone else saved this expense while the form was open: say so rather than overwrite them.
       const newer = staleExpense(trip.id, expense);
@@ -529,10 +554,15 @@ function ExpenseEditor({ trip, expenseId, scan, queuedId }: Params & { trip: Tri
 
       <Card style={{ alignItems: "center" }}>
         {preview && (
-          <Image source={{ uri: preview }} style={{ width: 120, height: 160, borderRadius: 8, marginBottom: 12 }} />
+          <Image
+            source={{ uri: preview }}
+            accessible
+            accessibilityLabel="Receipt photo preview"
+            style={{ width: 120, height: 160, borderRadius: 8, marginBottom: 12 }}
+          />
         )}
         {scanning ? (
-          <View style={{ alignItems: "center", gap: 8, paddingVertical: 8 }}>
+          <View style={{ alignItems: "center", gap: 8, paddingVertical: 8 }} accessibilityLiveRegion="polite">
             <ActivityIndicator />
             <Text style={styles.muted}>Reading and translating the receipt…</Text>
           </View>
@@ -586,6 +616,7 @@ function ExpenseEditor({ trip, expenseId, scan, queuedId }: Params & { trip: Tri
       <Label>Amount</Label>
       <View style={{ flexDirection: "row", gap: 8, marginBottom: 6 }}>
         <Input
+          accessibilityLabel={`Amount in ${currency}`}
           style={{ flex: 1, fontSize: 22, fontWeight: "700" }}
           keyboardType="decimal-pad"
           placeholder="0"
@@ -600,37 +631,28 @@ function ExpenseEditor({ trip, expenseId, scan, queuedId }: Params & { trip: Tri
       </View>
 
       {currency !== trip.baseCurrency && (
-        <Card style={{ marginTop: 6 }}>
-          <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
-            <Text style={{ color: colors.text }}>1 {currency} =</Text>
-            <Input
-              style={{ flex: 1, paddingVertical: 6 }}
-              keyboardType="decimal-pad"
-              value={rateText}
-              onChangeText={(t) => {
-                ++rateRequest.current;
-                setRateEdited(true);
-                setRateCurrency(currency);
-                setRateBase(trip.baseCurrency);
-                setRateLoading(false);
-                setRateText(t);
-                setRateInfo("Custom rate");
-              }}
-            />
-            <Text style={{ color: colors.text }}>{trip.baseCurrency}</Text>
-            <Button title="↻" variant="ghost" loading={rateLoading} onPress={() => loadRate(currency, true)} />
-          </View>
-          {(rateInfo || rateWarning) && (
-            <Text style={[styles.muted, { fontSize: 12, marginTop: 6 }]}>
-              {rateWarning ? "Custom rate differs greatly from the live rate. Check it carefully." : rateInfo}
-            </Text>
-          )}
-          {amount != null && rate != null && (
-            <Text style={{ marginTop: 8, fontSize: 18, fontWeight: "700", color: colors.tint }}>
-              ≈ {formatMoney(amount * rate, trip.baseCurrency)}
-            </Text>
-          )}
-        </Card>
+        <RateField
+          currency={currency}
+          baseCurrency={trip.baseCurrency}
+          rateText={rateText}
+          rateLoading={rateLoading}
+          rateInfo={rateInfo}
+          rateWarning={rateWarning}
+          amount={amount}
+          rate={rate}
+          onRateChange={(t) => {
+            ++rateRequest.current;
+            setRateEdited(true);
+            setRateCurrency(currency);
+            setRateBase(trip.baseCurrency);
+            setRateLoading(false);
+            setRateText(t);
+            setRateInfo("Custom rate");
+            setRateSource("Custom rate");
+            setRateFetchedAt(Date.now());
+          }}
+          onRefresh={() => loadRate(currency, true)}
+        />
       )}
 
       {amount != null && rate != null && view.translated && currency !== view.home && (
@@ -645,14 +667,20 @@ function ExpenseEditor({ trip, expenseId, scan, queuedId }: Params & { trip: Tri
       <Label>Category</Label>
       <View style={[styles.chips, { marginBottom: 8 }]}>
         {CATEGORIES.map((c) => (
-          <Chip key={c.key} label={`${c.icon} ${c.label}`} selected={category === c.key} onPress={() => setCategory(c.key)} />
+          <Chip key={c.key} label={`${c.icon} ${c.label}`} selected={category === c.key} accessibilityLabel={`Category ${c.label}`} onPress={() => setCategory(c.key)} />
         ))}
       </View>
 
       <Label>Paid by</Label>
       <View style={[styles.chips, { marginBottom: 8 }]}>
         {trip.members.map((m) => (
-          <Chip key={m.id} label={m.name} selected={paidBy === m.id} onPress={() => setPaidBy(m.id)} />
+          <Chip
+            key={m.id}
+            label={m.name}
+            selected={paidBy === m.id}
+            accessibilityLabel={`Paid by ${m.name}`}
+            onPress={() => setPaidBy(m.id)}
+          />
         ))}
       </View>
 
@@ -663,16 +691,30 @@ function ExpenseEditor({ trip, expenseId, scan, queuedId }: Params & { trip: Tri
             key={m.id}
             label={m.name}
             selected={memberIds.includes(m.id)}
-            onPress={() => setMemberIds(toggle(memberIds, m.id))}
+            accessibilityLabel={`Split with ${m.name}`}
+            onPress={() => {
+              setMemberIds(toggle(memberIds, m.id));
+              setWeights((current) => ({ ...current, [m.id]: current[m.id] ?? 1 }));
+            }}
           />
         ))}
       </View>
 
       <Label>How to split</Label>
       <View style={[styles.chips, { marginBottom: 8 }]}>
-        <Chip label="Equally" selected={splitType === "equal"} onPress={() => setSplitType("equal")} />
-        <Chip label="By item" selected={splitType === "items"} onPress={() => setSplitType("items")} />
+        <Chip label="Equally" selected={splitType === "equal"} accessibilityLabel="Split equally" onPress={() => setSplitType("equal")} />
+        <Chip label="By item" selected={splitType === "items"} accessibilityLabel="Split by item" onPress={() => setSplitType("items")} />
+        <Chip label="By shares" selected={splitType === "shares"} accessibilityLabel="Split by shares" onPress={() => setSplitType("shares")} />
       </View>
+
+      {splitType === "shares" && (
+        <ShareWeights
+          members={trip.members}
+          memberIds={memberIds}
+          weights={weights}
+          onChange={(memberId, weight) => setWeights((current) => ({ ...current, [memberId]: weight }))}
+        />
+      )}
 
       {(splitType === "items" || (receipt?.items.length ?? 0) > 0) && (
         <ReceiptItems
@@ -698,88 +740,22 @@ function ExpenseEditor({ trip, expenseId, scan, queuedId }: Params & { trip: Tri
       )}
 
       {valid && memberIds.length > 0 && splitType === "items" && breakdowns.length > 0 && (
-        <Card>
-          <Text style={styles.h2}>Each person&apos;s share</Text>
-          <Text style={[styles.muted, { fontSize: 12, marginBottom: 10 }]}>
-            Detailed breakdown: claimed items, proportional tax &amp; tip, and final totals.
-          </Text>
-          {breakdowns.map((b) => (
-            <View
-              key={b.memberId}
-              style={{
-                marginBottom: 12,
-                paddingBottom: 10,
-                borderBottomWidth: StyleSheet.hairlineWidth,
-                borderBottomColor: colors.border,
-              }}
-            >
-              <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 4 }}>
-                <Text style={{ fontWeight: "700", fontSize: 15, color: colors.text }}>{name(b.memberId)}</Text>
-                <View style={{ alignItems: "flex-end" }}>
-                  <Text style={{ fontWeight: "700", fontSize: 15, color: colors.tint }}>
-                    {formatMoney(b.totalShare, currency)}
-                  </Text>
-                  {currency !== trip.baseCurrency && (
-                    <Text style={[styles.muted, { fontSize: 12 }]}>
-                      ≈ {formatMoney(b.totalShareBase, trip.baseCurrency)}
-                    </Text>
-                  )}
-                </View>
-              </View>
-
-              {b.items.length > 0 ? (
-                <View style={{ marginVertical: 4, gap: 2 }}>
-                  {b.items.map((it, idx) => (
-                    <View key={idx} style={{ flexDirection: "row", justifyContent: "space-between" }}>
-                      <Text style={{ flex: 1, color: colors.text, fontSize: 13 }}>
-                        {it.quantity > 1 ? `${it.quantity}× ` : ""}
-                        {it.translatedName}
-                        {it.isUnassigned ? " (shared by all)" : it.sharedCount > 1 ? ` (shared 1/${it.sharedCount})` : ""}
-                      </Text>
-                      <Text style={{ color: colors.text, fontSize: 13, marginLeft: 8 }}>
-                        {formatMoney(it.sharePrice, currency)}
-                      </Text>
-                    </View>
-                  ))}
-                </View>
-              ) : (
-                <Text style={[styles.muted, { fontSize: 12, fontStyle: "italic", marginVertical: 4 }]}>
-                  No items claimed
-                </Text>
-              )}
-
-              <View style={{ marginTop: 4, gap: 2 }}>
-                <View style={{ flexDirection: "row", justifyContent: "space-between" }}>
-                  <Text style={[styles.muted, { fontSize: 12 }]}>Items subtotal</Text>
-                  <Text style={[styles.muted, { fontSize: 12 }]}>{formatMoney(b.itemSubtotal, currency)}</Text>
-                </View>
-                <View style={{ flexDirection: "row", justifyContent: "space-between" }}>
-                  <Text style={[styles.muted, { fontSize: 12 }]}>Tax &amp; tip share</Text>
-                  <Text style={[styles.muted, { fontSize: 12 }]}>
-                    {b.taxAndTipShare > 0 ? "+" : ""}{formatMoney(b.taxAndTipShare, currency)}
-                  </Text>
-                </View>
-              </View>
-            </View>
-          ))}
-        </Card>
+        <ItemizedShareBreakdown
+          breakdowns={breakdowns}
+          members={trip.members}
+          currency={currency}
+          baseCurrency={trip.baseCurrency}
+        />
       )}
 
       {valid && memberIds.length > 0 && (splitType === "equal" || breakdowns.length === 0) && (
-        <Card>
-          <Text style={styles.h2}>Each person&apos;s share</Text>
-          {Object.entries(shares).map(([mid, share]) => (
-            <View key={mid} style={{ flexDirection: "row", paddingVertical: 3 }}>
-              <Text style={{ flex: 1, color: colors.text }}>{name(mid)}</Text>
-              <Text style={{ color: colors.text }}>{formatMoney(share, currency)}</Text>
-              {currency !== trip.baseCurrency && (
-                <Text style={[styles.muted, { width: 100, textAlign: "right" }]}>
-                  {formatMoney(share * rate!, trip.baseCurrency)}
-                </Text>
-              )}
-            </View>
-          ))}
-        </Card>
+        <ShareSummary
+          shares={shares}
+          members={trip.members}
+          currency={currency}
+          baseCurrency={trip.baseCurrency}
+          rate={rate}
+        />
       )}
 
       <Button
@@ -796,470 +772,3 @@ function ExpenseEditor({ trip, expenseId, scan, queuedId }: Params & { trip: Tri
 function toggle(list: string[], memberId: string) {
   return list.includes(memberId) ? list.filter((x) => x !== memberId) : [...list, memberId];
 }
-
-function createExpenseRecord(params: {
-  id: string;
-  existing?: Expense;
-  queued?: { id: string; capturedAt: number };
-  description: string;
-  category: Category;
-  amount: number;
-  currency: string;
-  rateToBase: number;
-  paidBy: string;
-  date: string;
-  split: Split;
-  receipt?: ReceiptData;
-}): Expense {
-  const now = Date.now();
-  return {
-    id: params.id,
-    description: params.description.trim(),
-    category: params.category,
-    amount: params.amount,
-    currency: params.currency,
-    rateToBase: params.rateToBase,
-    paidBy: params.paidBy,
-    date: params.date,
-    split: params.split,
-    receipt: params.receipt,
-    ...(params.existing?.createdBy ? { createdBy: params.existing.createdBy } : {}),
-    // The version this edit started from; the server refuses the save if someone changed it since.
-    ...(params.existing?.revision != null ? { revision: params.existing.revision } : {}),
-    createdAt: params.existing?.createdAt ?? params.queued?.capturedAt ?? now,
-    updatedAt: now,
-  };
-}
-
-/**
- * The scanned line items, with who had each one when splitting by item.
- * Memoized: a long receipt is a lot of chips, and typing elsewhere in the
- * form shouldn't redraw them all.
- */
-const ReceiptItems = memo(function ReceiptItems({
-  receipt,
-  currency,
-  byItem,
-  members,
-  memberIds,
-  assignments,
-  onToggle,
-  onAddItem,
-  onEditItem,
-  onDeleteItem,
-  taxText,
-  onTaxChange,
-  tipText,
-  onTipChange,
-  feesText,
-  onFeesChange,
-  amount,
-  onSetAmount,
-}: {
-  receipt?: ReceiptData;
-  currency: string;
-  byItem: boolean;
-  members: Member[];
-  memberIds: string[];
-  assignments: Record<number, string[]>;
-  onToggle: (item: number, memberId: string) => void;
-  onAddItem: (title: string, price: number, qty: number) => void;
-  onEditItem: (index: number, title: string, price: number, qty: number) => void;
-  onDeleteItem: (index: number) => void;
-  taxText: string;
-  onTaxChange: (t: string) => void;
-  tipText: string;
-  onTipChange: (t: string) => void;
-  feesText: string;
-  onFeesChange: (t: string) => void;
-  amount: number | null;
-  onSetAmount: (amt: number) => void;
-}) {
-  const { colors, styles } = useTheme();
-
-  const [isAdding, setIsAdding] = useState(false);
-  const [addTitle, setAddTitle] = useState("");
-  const [addPrice, setAddPrice] = useState("");
-  const [addQty, setAddQty] = useState("1");
-
-  const [editingIndex, setEditingIndex] = useState<number | null>(null);
-  const [editTitle, setEditTitle] = useState("");
-  const [editPrice, setEditPrice] = useState("");
-  const [editQty, setEditQty] = useState("1");
-
-  const items = receipt?.items ?? [];
-  const itemsSubtotal = items.reduce((sum, it) => sum + it.price, 0);
-  const tax = parseAmount(taxText, currency) ?? 0;
-  const tip = parseAmount(tipText, currency) ?? 0;
-  const fees = parseAmount(feesText, currency) ?? 0;
-  const calculatedTotal = fromMinor(
-    toMinor(itemsSubtotal + tax + tip + fees, currency),
-    currency,
-  );
-
-  const isInSync = () =>
-    amount == null ||
-    amount === 0 ||
-    toMinor(amount, currency) === toMinor(calculatedTotal, currency);
-
-  const submitAdd = () => {
-    const trimmed = addTitle.trim();
-    const priceVal = parseAmount(addPrice, currency);
-    if (!trimmed) {
-      Alert.alert("Missing name", "Please enter an item name.");
-      return;
-    }
-    if (priceVal == null) {
-      Alert.alert("Invalid price", "Please enter a valid price for the item.");
-      return;
-    }
-    const qtyVal = Math.max(1, parseInt(addQty, 10) || 1);
-    const sync = isInSync();
-    onAddItem(trimmed, priceVal, qtyVal);
-    setAddTitle("");
-    setAddPrice("");
-    setAddQty("1");
-    setIsAdding(false);
-    if (sync) {
-      const nextTotal = fromMinor(
-        toMinor(Math.max(0, itemsSubtotal + priceVal + tax + tip + fees), currency),
-        currency,
-      );
-      onSetAmount(nextTotal);
-    }
-  };
-
-  const startEdit = (i: number) => {
-    const item = items[i];
-    if (!item) return;
-    setIsAdding(false);
-    setEditingIndex(i);
-    setEditTitle(item.translatedName || item.name);
-    setEditPrice(String(item.price));
-    setEditQty(String(item.quantity));
-  };
-
-  const submitEdit = () => {
-    if (editingIndex == null || !items[editingIndex]) return;
-    const trimmed = editTitle.trim();
-    const priceVal = parseAmount(editPrice, currency);
-    if (!trimmed) {
-      Alert.alert("Missing name", "Please enter an item name.");
-      return;
-    }
-    if (priceVal == null) {
-      Alert.alert("Invalid price", "Please enter a valid price for the item.");
-      return;
-    }
-    const qtyVal = Math.max(1, parseInt(editQty, 10) || 1);
-    const oldPrice = items[editingIndex].price;
-    const sync = isInSync();
-    onEditItem(editingIndex, trimmed, priceVal, qtyVal);
-    if (sync) {
-      const nextTotal = fromMinor(
-        toMinor(Math.max(0, itemsSubtotal - oldPrice + priceVal + tax + tip + fees), currency),
-        currency,
-      );
-      onSetAmount(nextTotal);
-    }
-    setEditingIndex(null);
-  };
-
-  return (
-    <Card>
-      <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
-        <Text style={styles.h2}>
-          Line items {receipt?.language && <Text style={[styles.muted, { fontSize: 13 }]}>· {receipt.language}</Text>}
-        </Text>
-        {items.length > 0 && (
-          <Text style={{ fontWeight: "700", color: colors.text }}>
-            Subtotal: {formatMoney(itemsSubtotal, currency)}
-          </Text>
-        )}
-      </View>
-
-      {!!receipt?.merchant && !!receipt.merchantTranslated && (
-        <Text style={[styles.muted, { marginBottom: 8 }]}>{receipt.merchant}</Text>
-      )}
-
-      {items.length === 0 ? (
-        <Text style={[styles.muted, { marginVertical: 8, fontStyle: "italic" }]}>
-          No line items added yet. Add items below to split individually.
-        </Text>
-      ) : (
-        items.map((item, i) => {
-          const isEditingThis = editingIndex === i;
-          if (isEditingThis) {
-            return (
-              <View
-                key={i}
-                style={{
-                  paddingVertical: 10,
-                  borderTopWidth: i ? 1 : 0,
-                  borderTopColor: colors.border,
-                  backgroundColor: colors.primarySoft,
-                  paddingHorizontal: 8,
-                  borderRadius: 8,
-                  marginVertical: 4,
-                }}
-              >
-                <Text style={[styles.label, { color: colors.text }]}>Edit Item</Text>
-                <Input
-                  placeholder="Item name"
-                  value={editTitle}
-                  onChangeText={setEditTitle}
-                  style={{ marginBottom: 6 }}
-                />
-                <View style={{ flexDirection: "row", gap: 8, marginBottom: 8 }}>
-                  <Input
-                    placeholder="Price"
-                    value={editPrice}
-                    onChangeText={setEditPrice}
-                    keyboardType="decimal-pad"
-                    style={{ flex: 2 }}
-                  />
-                  <Input
-                    placeholder="Qty"
-                    value={editQty}
-                    onChangeText={setEditQty}
-                    keyboardType="number-pad"
-                    style={{ flex: 1 }}
-                  />
-                </View>
-                <View style={{ flexDirection: "row", gap: 8 }}>
-                  <Button title="Save" onPress={submitEdit} style={{ flex: 1, paddingVertical: 8 }} />
-                  <Button
-                    title="Cancel"
-                    variant="ghost"
-                    onPress={() => setEditingIndex(null)}
-                    style={{ flex: 1, paddingVertical: 8 }}
-                  />
-                </View>
-              </View>
-            );
-          }
-
-          const assigned = (assignments[i] ?? []).filter((mid) => memberIds.includes(mid));
-          const isUnassigned = assigned.length === 0;
-
-          return (
-            <View
-              key={i}
-              style={{ paddingVertical: 8, borderTopWidth: i ? 1 : 0, borderTopColor: colors.border }}
-            >
-              <View style={{ flexDirection: "row", alignItems: "center" }}>
-                <View style={{ flex: 1 }}>
-                  <Text style={{ fontWeight: "600", color: colors.text }}>
-                    {item.quantity > 1 ? `${item.quantity}× ` : ""}
-                    {item.translatedName || item.name}
-                  </Text>
-                  {item.translatedName && item.name && item.translatedName !== item.name && (
-                    <Text style={[styles.muted, { fontSize: 12 }]}>{item.name}</Text>
-                  )}
-                </View>
-                <Text style={{ color: colors.text, fontWeight: "600", marginRight: 10 }}>
-                  {formatMoney(item.price, currency)}
-                </Text>
-                <Pressable onPress={() => startEdit(i)} style={{ paddingHorizontal: 6, paddingVertical: 4 }}>
-                  <Text style={{ color: colors.tint, fontSize: 13, fontWeight: "600" }}>Edit</Text>
-                </Pressable>
-                <Pressable
-                  onPress={() => {
-                    const sync = isInSync();
-                    const deletedPrice = item.price;
-                    onDeleteItem(i);
-                    setEditingIndex(null);
-                    if (sync) {
-                      const nextTotal = fromMinor(
-                        toMinor(Math.max(0, itemsSubtotal - deletedPrice + tax + tip + fees), currency),
-                        currency,
-                      );
-                      onSetAmount(nextTotal);
-                    }
-                  }}
-                  style={{ paddingHorizontal: 6, paddingVertical: 4 }}
-                >
-                  <Text style={{ color: colors.negative, fontSize: 13, fontWeight: "600" }}>✕</Text>
-                </Pressable>
-              </View>
-
-              {byItem && (
-                <>
-                  <View style={[styles.chips, { marginTop: 6 }]}>
-                    {memberIds.map((mid) => (
-                      <Chip
-                        key={mid}
-                        label={members.find((m) => m.id === mid)?.name ?? "?"}
-                        selected={(assignments[i] ?? []).includes(mid)}
-                        onPress={() => onToggle(i, mid)}
-                      />
-                    ))}
-                  </View>
-                  <Text style={[styles.muted, { fontSize: 11, marginTop: 2 }]}>
-                    {memberIds.length === 0
-                      ? "Select members to split with above"
-                      : isUnassigned
-                        ? `Shared by all ${memberIds.length} members (${formatMoney(item.price / memberIds.length, currency)} each)`
-                        : assigned.length === 1
-                          ? `Assigned to ${members.find((m) => m.id === assigned[0])?.name ?? "?"}`
-                          : `Split between ${assigned.length} members (${formatMoney(item.price / assigned.length, currency)} each)`}
-                  </Text>
-                </>
-              )}
-            </View>
-          );
-        })
-      )}
-
-      {/* Add Item form */}
-      {isAdding ? (
-        <View
-          style={{
-            marginTop: 10,
-            padding: 10,
-            borderRadius: 8,
-            backgroundColor: colors.primarySoft,
-          }}
-        >
-          <Text style={[styles.label, { color: colors.text }]}>Add New Item</Text>
-          <Input
-            placeholder="Item title (e.g. Pasta, Coffee)"
-            value={addTitle}
-            onChangeText={setAddTitle}
-            style={{ marginBottom: 6 }}
-          />
-          <View style={{ flexDirection: "row", gap: 8, marginBottom: 8 }}>
-            <Input
-              placeholder="Price"
-              value={addPrice}
-              onChangeText={setAddPrice}
-              keyboardType="decimal-pad"
-              style={{ flex: 2 }}
-            />
-            <Input
-              placeholder="Qty (1)"
-              value={addQty}
-              onChangeText={setAddQty}
-              keyboardType="number-pad"
-              style={{ flex: 1 }}
-            />
-          </View>
-          <View style={{ flexDirection: "row", gap: 8 }}>
-            <Button title="Add item" onPress={submitAdd} style={{ flex: 1, paddingVertical: 8 }} />
-            <Button
-              title="Cancel"
-              variant="ghost"
-              onPress={() => {
-                setIsAdding(false);
-                setAddTitle("");
-                setAddPrice("");
-                setAddQty("1");
-              }}
-              style={{ flex: 1, paddingVertical: 8 }}
-            />
-          </View>
-        </View>
-      ) : (
-        <Button
-          title="+ Add line item"
-          variant="secondary"
-          onPress={() => {
-            setEditingIndex(null);
-            setIsAdding(true);
-          }}
-          style={{ marginTop: 10 }}
-        />
-      )}
-
-      {/* Tax, Tip & Fees section */}
-      <View style={{ marginTop: 14, paddingTop: 12, borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: colors.border }}>
-        <Label>Tax, Tip &amp; Service Charges</Label>
-        <View style={{ flexDirection: "row", gap: 8, marginBottom: 8 }}>
-          <View style={{ flex: 1 }}>
-            <Text style={[styles.muted, { fontSize: 11, marginBottom: 4 }]}>Tax ({currency})</Text>
-            <Input
-              placeholder="0"
-              value={taxText}
-              onChangeText={(t) => {
-                const sync = isInSync();
-                onTaxChange(t);
-                if (sync) {
-                  const newTax = parseAmount(t, currency) ?? 0;
-                  const nextTotal = fromMinor(
-                    toMinor(itemsSubtotal + newTax + tip + fees, currency),
-                    currency,
-                  );
-                  onSetAmount(nextTotal);
-                }
-              }}
-              keyboardType="decimal-pad"
-            />
-          </View>
-          <View style={{ flex: 1 }}>
-            <Text style={[styles.muted, { fontSize: 11, marginBottom: 4 }]}>Tip ({currency})</Text>
-            <Input
-              placeholder="0"
-              value={tipText}
-              onChangeText={(t) => {
-                const sync = isInSync();
-                onTipChange(t);
-                if (sync) {
-                  const newTip = parseAmount(t, currency) ?? 0;
-                  const nextTotal = fromMinor(
-                    toMinor(itemsSubtotal + tax + newTip + fees, currency),
-                    currency,
-                  );
-                  onSetAmount(nextTotal);
-                }
-              }}
-              keyboardType="decimal-pad"
-            />
-          </View>
-          <View style={{ flex: 1 }}>
-            <Text style={[styles.muted, { fontSize: 11, marginBottom: 4 }]}>Fees ({currency})</Text>
-            <Input
-              placeholder="0"
-              value={feesText}
-              onChangeText={(t) => {
-                const sync = isInSync();
-                onFeesChange(t);
-                if (sync) {
-                  const newFees = parseAmount(t, currency) ?? 0;
-                  const nextTotal = fromMinor(
-                    toMinor(itemsSubtotal + tax + tip + newFees, currency),
-                    currency,
-                  );
-                  onSetAmount(nextTotal);
-                }
-              }}
-              keyboardType="decimal-pad"
-            />
-          </View>
-        </View>
-
-        {(itemsSubtotal > 0 || tax > 0 || tip > 0 || fees > 0) && (
-          <View style={{ marginTop: 4, padding: 8, borderRadius: 8, backgroundColor: colors.bg }}>
-            <Text style={{ fontSize: 13, color: colors.text }}>
-              Items: {formatMoney(itemsSubtotal, currency)}
-              {tax > 0 ? ` + Tax: ${formatMoney(tax, currency)}` : ""}
-              {tip > 0 ? ` + Tip: ${formatMoney(tip, currency)}` : ""}
-              {fees > 0 ? ` + Fees: ${formatMoney(fees, currency)}` : ""}
-              {" = "}
-              <Text style={{ fontWeight: "700" }}>{formatMoney(calculatedTotal, currency)}</Text>
-            </Text>
-            {toMinor(amount ?? 0, currency) !== toMinor(calculatedTotal, currency) && calculatedTotal > 0 && (
-              <Pressable
-                onPress={() => onSetAmount(calculatedTotal)}
-                style={{ marginTop: 6, alignSelf: "flex-start" }}
-              >
-                <Text style={{ color: colors.tint, fontWeight: "600", fontSize: 13 }}>
-                  ↳ Set bill amount to {formatMoney(calculatedTotal, currency)}
-                </Text>
-              </Pressable>
-            )}
-          </View>
-        )}
-      </View>
-    </Card>
-  );
-});

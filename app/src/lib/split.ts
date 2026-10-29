@@ -78,9 +78,25 @@ export function computeShares(expense: Splittable): Record<string, number> {
   const items = expense.receipt?.items ?? [];
 
   if (people.length === 0) return {};
-  if (split.type === "equal" || items.length === 0) return evenly(amount, people, currency);
+  if (split.type === "equal") return evenly(amount, people, currency);
 
-  const assignments = split.type === "items" && split.assignments ? split.assignments : {};
+  if (split.type === "shares") {
+    const weights = new Map<string, number>();
+    for (const id of people) {
+      const weight = split.weights[id];
+      if (Number.isFinite(weight) && weight > 0) weights.set(id, weight);
+    }
+    if (weights.size === 0) return evenly(amount, people, currency);
+    const allocated = allocate(toMinor(amount, currency), weights);
+    const result: Record<string, number> = {};
+    for (const id of people) result[id] = fromMinor(allocated.get(id) ?? 0, currency);
+    return result;
+  }
+
+  // An itemized expense without readable items has nothing to allocate by.
+  if (items.length === 0) return evenly(amount, people, currency);
+
+  const assignments = split.assignments ? split.assignments : {};
   const { memberMinorSubtotals, itemsMinorTotal } = allocateItemShares(
     items,
     assignments,

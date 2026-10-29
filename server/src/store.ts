@@ -23,6 +23,19 @@ export interface Expense {
   [key: string]: unknown;
 }
 
+/** A payment between members, in the trip's base currency. */
+export interface Settlement {
+  id: string;
+  from: string;
+  to: string;
+  amount: number;
+  currency: string;
+  date: string;
+  updatedAt: number;
+  revision?: number;
+  [key: string]: unknown;
+}
+
 /** Why an edit was refused because the expense moved on since the editor last saw it. */
 export class ExpenseConflictError extends Error {
   constructor(
@@ -35,8 +48,16 @@ export class ExpenseConflictError extends Error {
   }
 }
 
+/** A payment was changed by someone else before this edit landed. */
+export class SettlementConflictError extends Error {
+  constructor(public readonly current: Settlement | undefined) {
+    super("This payment was changed by someone else.");
+    this.name = "SettlementConflictError";
+  }
+}
+
 /** Equality of the user-editable content, ignoring server/clock bookkeeping. */
-function sameContent(a: Expense, b: Expense): boolean {
+function sameContent(a: unknown, b: unknown): boolean {
   const canon = (value: unknown): unknown => {
     if (Array.isArray(value)) return value.map(canon);
     if (value && typeof value === "object") {
@@ -58,9 +79,13 @@ export interface Trip {
   inviteCode?: string;
   name: string;
   baseCurrency: string;
+  /** Optional spending cap for the whole trip, in the base currency. */
+  budget?: number;
   members: Member[];
   expenses: Expense[];
+  settlements?: Settlement[];
   deletedExpenseIds: string[];
+  deletedSettlementIds?: string[];
   createdAt: number;
   updatedAt: number;
   /** Server-owned version; unlike updatedAt it is immune to device clock skew. */
@@ -69,7 +94,9 @@ export interface Trip {
   inviteExpiresAt?: number | null;
 }
 
-export type NewTrip = Pick<Trip, "id" | "name" | "baseCurrency" | "members" | "expenses"> & {
+export type NewTrip = Pick<Trip, "id" | "name" | "baseCurrency" | "members"> & {
+  expenses?: Expense[];
+  settlements?: Settlement[];
   ownerId?: string;
 };
 
@@ -83,8 +110,24 @@ export function canEditExpense(trip: Trip, userId: string, expense: Expense | un
   return typeof expense.createdBy === "string" && expense.createdBy === userId;
 }
 
+/** Any member may record a payment; only its creator or the trip owner may change it. */
+export function canEditSettlement(trip: Trip, userId: string, settlement: Settlement | undefined): boolean {
+  if (trip.ownerId === userId) return true;
+  if (!trip.members.some((m) => m.userId === userId)) return false;
+  if (!settlement) return true;
+  return typeof settlement.createdBy === "string" && settlement.createdBy === userId;
+}
+
 const CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
 const INVITE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+/** Older stored trips predate payments; fill the collections the server relies on. */
+function normalizeTrip(trip: Trip): Trip {
+  if (!Array.isArray(trip.settlements)) trip.settlements = [];
+  if (!Array.isArray(trip.deletedSettlementIds)) trip.deletedSettlementIds = [];
+  if (!Array.isArray(trip.deletedExpenseIds)) trip.deletedExpenseIds = [];
+  return trip;
+}
 
 /**
  * Trips persisted in SQLite (one row per trip, the app-owned JSON kept whole).
@@ -101,6 +144,13 @@ const INVITE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
  * There is deliberately no in-memory copy of trips: that is what makes it safe
  * to run more than one process against the same database file.
  */
+export class BaseCurrencySettlementError extends Error {
+  constructor() {
+    super("A trip's base currency cannot change while it has recorded settlements.");
+    this.name = "BaseCurrencySettlementError";
+  }
+}
+
 export class TripStore {
   private db?: DatabaseSync;
 
@@ -153,7 +203,7 @@ export class TripStore {
   findByCode(code: string): Trip | undefined {
     const row = this.handle().prepare("SELECT data FROM trips WHERE code = ?").get(code.trim().toUpperCase());
     if (!row) return undefined;
-    const trip = JSON.parse(String(row.data)) as Trip;
+    const trip = normalizeTrip(JSON.parse(String(row.data)) as Trip);
     if (trip.inviteExpiresAt != null && Date.now() > trip.inviteExpiresAt) return undefined;
     return trip;
   }
@@ -166,7 +216,10 @@ export class TripStore {
         ...input,
         code: this.newJoinCode(),
         inviteExpiresAt: now + INVITE_TTL_MS,
+        expenses: input.expenses ?? [],
+        settlements: input.settlements ?? [],
         deletedExpenseIds: [],
+        deletedSettlementIds: [],
         createdAt: now,
         updatedAt: now,
         revision: this.nextRevision(),
@@ -235,10 +288,20 @@ export class TripStore {
     });
   }
 
-  update(id: string, patch: Partial<Pick<Trip, "name" | "baseCurrency">>) {
+  update(id: string, patch: Partial<Pick<Trip, "name" | "baseCurrency">> & { budget?: number | null }) {
     return this.mutate(id, (trip) => {
       if (patch.name) trip.name = patch.name;
-      if (patch.baseCurrency) trip.baseCurrency = patch.baseCurrency;
+      if (patch.baseCurrency && patch.baseCurrency !== trip.baseCurrency) {
+        if ((trip.settlements ?? []).some((settlement) =>
+            !(settlement?.id && (trip.deletedSettlementIds ?? []).includes(settlement.id)))) {
+          throw new BaseCurrencySettlementError();
+        }
+        trip.baseCurrency = patch.baseCurrency;
+      }
+      if (patch.budget !== undefined) {
+        if (patch.budget === null) delete trip.budget;
+        else trip.budget = patch.budget;
+      }
     });
   }
 
@@ -292,6 +355,50 @@ export class TripStore {
     return this.mutate(id, (trip) => {
       trip.expenses = trip.expenses.filter((e) => e.id !== expenseId);
       if (!trip.deletedExpenseIds.includes(expenseId)) trip.deletedExpenseIds.push(expenseId);
+    });
+  }
+
+  /**
+   * Records or edits a payment between members. `baseRevision` behaves like an
+   * expense edit: a stale copy is refused rather than silently overwriting the
+   * other person's correction. A retry that already landed is a no-op.
+   */
+  upsertSettlement(id: string, settlement: Settlement, baseRevision?: number) {
+    return this.mutate(id, (trip, revision) => {
+      if (!Number.isFinite(settlement.amount) || settlement.amount <= 0) return false;
+      if (settlement.currency !== trip.baseCurrency || settlement.from === settlement.to) return false;
+      if (!trip.members.some((member) => member.id === settlement.from) ||
+          !trip.members.some((member) => member.id === settlement.to)) return false;
+      if (!Array.isArray(trip.settlements)) trip.settlements = [];
+      if (!Array.isArray(trip.deletedSettlementIds)) trip.deletedSettlementIds = [];
+      const idx = trip.settlements.findIndex((candidate) => candidate.id === settlement.id);
+      const existing = idx === -1 ? undefined : trip.settlements[idx];
+      if (trip.deletedSettlementIds.includes(settlement.id)) {
+        if (baseRevision !== undefined) throw new SettlementConflictError(undefined);
+        return false;
+      }
+      if (existing && baseRevision !== undefined && (existing.revision ?? 0) !== baseRevision) {
+        if (sameContent(existing, settlement)) return false;
+        throw new SettlementConflictError(existing);
+      }
+      const { baseRevision: _base, ...clean } = settlement as Settlement & { baseRevision?: unknown };
+      const next: Settlement = {
+        ...clean,
+        createdAt: existing?.createdAt ?? (Number.isFinite(clean.createdAt) ? clean.createdAt : Date.now()),
+        updatedAt: Date.now(),
+        revision: revision(),
+      };
+      if (idx === -1) trip.settlements.push(next);
+      else trip.settlements[idx] = next;
+    });
+  }
+
+  deleteSettlement(id: string, settlementId: string) {
+    return this.mutate(id, (trip) => {
+      if (!Array.isArray(trip.settlements)) trip.settlements = [];
+      trip.settlements = trip.settlements.filter((settlement) => settlement.id !== settlementId);
+      trip.deletedSettlementIds = trip.deletedSettlementIds ?? [];
+      if (!trip.deletedSettlementIds.includes(settlementId)) trip.deletedSettlementIds.push(settlementId);
     });
   }
 
@@ -372,11 +479,11 @@ export class TripStore {
 
   private read(id: string): Trip | undefined {
     const row = this.handle().prepare("SELECT data FROM trips WHERE id = ?").get(id);
-    return row ? (JSON.parse(String(row.data)) as Trip) : undefined;
+    return row ? normalizeTrip(JSON.parse(String(row.data)) as Trip) : undefined;
   }
 
   private rows(rows: Record<string, unknown>[]): Trip[] {
-    return rows.map((row) => JSON.parse(String(row.data)) as Trip);
+    return rows.map((row) => normalizeTrip(JSON.parse(String(row.data)) as Trip));
   }
 
   private write(trip: Trip) {
@@ -436,7 +543,7 @@ export class TripStore {
           if (!Number.isInteger(trip.revision) || trip.revision! <= 0) trip.revision = this.nextRevision();
           // A duplicate join code would violate the unique index; the old in-memory index silently shadowed one.
           if (this.codeTaken(trip.code)) trip.code = this.newJoinCode();
-          this.write(trip);
+          this.write(normalizeTrip(trip));
         }
         db.prepare("INSERT INTO meta (key, value) VALUES ('json_imported', 1)").run();
       });

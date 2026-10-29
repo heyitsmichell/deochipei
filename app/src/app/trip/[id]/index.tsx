@@ -5,11 +5,15 @@ import { FlatList, Image, Pressable, Text, View, type ListRenderItem } from "rea
 import { ExpenseConflicts } from "../../../components/ExpenseConflicts";
 import { InviteSheet } from "../../../components/InviteSheet";
 import { PendingReceipts } from "../../../components/PendingReceipts";
+import { SettleUpCard } from "../../../components/SettleUpCard";
+import { TripExportCard } from "../../../components/TripExportCard";
+import { TripInsightsCard } from "../../../components/TripInsightsCard";
 import { Banner, Button, Card, Chip, CurrencyPicker, Input, useTheme } from "../../../components/ui";
 import { useAuth } from "../../../context/AuthContext";
 import type { HomeCurrencyView } from "../../../lib/homeCurrency";
-import { baseAmount, inspectLedger, type Ledger, type SettlementPlan, type Transfer } from "../../../lib/ledger";
+import { baseAmount, inspectLedger, type Ledger, type Transfer } from "../../../lib/ledger";
 import { formatMoney } from "../../../lib/money";
+import { parsePaymentRequest } from "../../../lib/paymentLink";
 import { pickReceiptImage } from "../../../lib/receiptImage";
 import { categoryIcon, type Expense, type Trip } from "../../../lib/types";
 import {
@@ -34,11 +38,18 @@ const NO_EXPENSES: Expense[] = [];
 
 export default function TripScreen() {
   const { styles } = useTheme();
-  const { id } = useLocalSearchParams<{ id: string }>();
+  const params = useLocalSearchParams<{
+    id: string;
+    settleFrom?: string;
+    settleTo?: string;
+    settleAmount?: string;
+  }>();
+  const id = params.id;
   const { refresh } = useTripActions();
   const trip = useTrip(id);
   const { connected } = useNetwork();
   const foreground = useAppInForeground();
+  const paymentRequest = parsePaymentRequest(params);
 
   // Poll while the screen is open so everyone sees new expenses quickly. Not
   // in the background or without a connection, where it would only fail and
@@ -59,27 +70,36 @@ export default function TripScreen() {
       </View>
     );
   }
-  return <TripView trip={trip} />;
+  return <TripView trip={trip} paymentRequest={paymentRequest} />;
 }
 
-function TripView({ trip }: { trip: Trip }) {
+function TripView({ trip, paymentRequest }: { trip: Trip; paymentRequest?: Transfer }) {
   const { styles } = useTheme();
-  const { removeDamagedExpense, saveChanges } = useTripActions();
+  const { removeDamagedExpense, removeDamagedSettlement, saveChanges } = useTripActions();
   const result = useMemo(() => inspectLedger(trip), [trip]);
-  if (result.ledger) return <TripContent trip={trip} ledger={result.ledger} />;
+  if (result.ledger) return <TripContent trip={trip} ledger={result.ledger} paymentRequest={paymentRequest} />;
   return <View style={[styles.screen, styles.content]}>
-    <Text style={styles.h2}>An expense needs correction</Text>
-    <Text style={styles.muted}>Totals and settlements are unavailable until damaged expenses are removed and entered again. Other expenses are still kept.</Text>
-    {result.invalid.map((expense) => <Card key={expense.index}>
-      <Text style={styles.h2}>{expense.description || "Damaged expense"}</Text>
+    <Text style={styles.h2}>A record needs correction</Text>
+    <Text style={styles.muted}>Totals and settlements are unavailable until damaged records are removed and entered again. Other records are still kept.</Text>
+    {result.invalid.map((expense) => <Card key={`${expense.kind ?? "expense"}-${expense.index}`}>
+      <Text style={styles.h2}>{expense.description || (expense.kind === "settlement" ? "Damaged payment" : "Damaged expense")}</Text>
       <Text style={styles.muted}>Record: {expense.id ?? `entry ${expense.index + 1}`}</Text>
-      <Button title={expense.id && trip.syncEnabled ? "Repair shared expense" : "Remove damaged expense"} variant="danger" onPress={() => Alert.alert("Repair damaged expense?",
-        expense.id && trip.syncEnabled
+      <Button title={expense.kind === "settlement" ? "Remove damaged payment" : expense.id && trip.syncEnabled ? "Repair shared expense" : "Remove damaged expense"} variant="danger" onPress={() => Alert.alert(expense.kind === "settlement" ? "Remove damaged payment?" : "Repair damaged expense?",
+        expense.kind === "settlement"
+          ? "The damaged payment will be removed from the trip ledger. Keep any details you need before confirming."
+          : expense.id && trip.syncEnabled
           ? "An intact server copy will be restored. If the server copy is also damaged, the expense will be removed for everyone. Unsent edits to this expense will be discarded. Keep any details you need before confirming."
           : "Keep any details you need, then enter the expense again.", [
         { text: "Cancel", style: "cancel" },
         { text: "Remove", style: "destructive", onPress: async () => {
-          try { await removeDamagedExpense(trip.id, expense.index, expense.value); await saveChanges(); }
+          try {
+            if (expense.kind === "settlement") {
+              removeDamagedSettlement(trip.id, expense.index, expense.value);
+            } else {
+              await removeDamagedExpense(trip.id, expense.index, expense.value);
+            }
+            await saveChanges();
+          }
           catch (error) { Alert.alert("Couldn't save the removal", error instanceof Error ? error.message : "Try again."); }
         } },
       ])} />
@@ -87,9 +107,9 @@ function TripView({ trip }: { trip: Trip }) {
   </View>;
 }
 
-function TripContent({ trip, ledger }: { trip: Trip; ledger: Ledger }) {
+function TripContent({ trip, ledger, paymentRequest }: { trip: Trip; ledger: Ledger; paymentRequest?: Transfer }) {
   const { colors, styles } = useTheme();
-  const { addMember, removeTripLocally, claimTripMember, setHomeCurrency, queueReceipt, retryFailed, discardFailed, resolveConflict } = useTripActions();
+  const { addMember, removeTripLocally, claimTripMember, setHomeCurrency, queueReceipt, retryFailed, discardFailed, resolveConflict, saveSettlement, deleteSettlement, patchTrip } = useTripActions();
   const { user, displayName: authName, avatarUrl: authAvatar } = useAuth();
   const me = useMe(trip.id);
   const pending = usePendingCount(trip.id);
@@ -100,7 +120,7 @@ function TripContent({ trip, ledger }: { trip: Trip; ledger: Ledger }) {
   const syncError = useSyncError(trip.id);
   const storageError = useStorageError();
   const network = useNetwork();
-  const [tab, setTab] = useState<Tab>("expenses");
+  const [tab, setTab] = useState<Tab>(paymentRequest ? "balances" : "expenses");
   const [adding, setAdding] = useState(false);
   const [newMember, setNewMember] = useState("");
   const [showDirect, setShowDirect] = useState(false);
@@ -225,7 +245,13 @@ function TripContent({ trip, ledger }: { trip: Trip; ledger: Ledger }) {
         <View style={{ flexDirection: "row", alignItems: "flex-start", gap: 12 }}>
           <View style={{ flex: 1 }}>
             <Text style={styles.muted}>Trip total</Text>
-            <Text style={styles.h1}>{total.main}</Text>
+            <Text
+              style={styles.h1}
+              accessibilityRole="header"
+              accessibilityLabel={`Trip total ${total.main}${total.original ? `, ${total.original}` : ""}`}
+            >
+              {total.main}
+            </Text>
             {total.original && (
               <Text style={[styles.muted, { fontSize: 13 }]}>
                 {total.original} · 1 {trip.baseCurrency} = {Number(view.rate!.toPrecision(4))} {home}
@@ -249,6 +275,7 @@ function TripContent({ trip, ledger }: { trip: Trip; ledger: Ledger }) {
               fontWeight: "600",
               color: myBalance.net >= 0 ? colors.positive : colors.negative,
             }}
+            accessibilityLiveRegion="polite"
           >
             {Math.abs(myBalance.net) < 0.01
               ? "You're all square"
@@ -257,7 +284,12 @@ function TripContent({ trip, ledger }: { trip: Trip; ledger: Ledger }) {
                 : `You owe ${withOriginal(view, -myBalance.net)}`}
           </Text>
         )}
-        <Pressable onPress={() => setInviting(true)} style={{ marginTop: 12 }}>
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel={trip.code ? `Trip code ${trip.code}. Invite people with a QR code` : "Invite people. The code appears once synced"}
+          onPress={() => setInviting(true)}
+          style={{ marginTop: 12 }}
+        >
           <Text style={styles.link}>
             {trip.code ? `Trip code: ${trip.code} · Invite with QR code` : "Invite people (code appears once synced)"}
           </Text>
@@ -299,7 +331,18 @@ function TripContent({ trip, ledger }: { trip: Trip; ledger: Ledger }) {
                 {ledger.balances().map((b) => {
                   const shown = view.format(b.net);
                   return (
-                    <View key={b.memberId} style={{ flexDirection: "row", paddingVertical: 6 }}>
+                    <View
+                      key={b.memberId}
+                      style={{ flexDirection: "row", paddingVertical: 6 }}
+                      accessibilityLabel={
+                        `${name(b.memberId)}${b.memberId === me ? ", you" : ""}: ` +
+                        (Math.abs(b.net) < 0.005
+                          ? "settled up"
+                          : b.net > 0
+                            ? `is owed ${shown.main}${shown.original ? `, ${shown.original}` : ""}`
+                            : `owes ${shown.main}${shown.original ? `, ${shown.original}` : ""}`)
+                      }
+                    >
                       <Text style={{ flex: 1, color: colors.text }}>
                         {name(b.memberId)}
                         {b.memberId === me ? " (you)" : ""}
@@ -320,15 +363,32 @@ function TripContent({ trip, ledger }: { trip: Trip; ledger: Ledger }) {
                   );
                 })}
               </Card>
+              <TripInsightsCard
+                trip={trip}
+                editable={trip.ownerId ? trip.ownerId === user?.id : !trip.syncEnabled}
+                onSaveBudget={(budget) => {
+                  try {
+                    patchTrip(trip.id, { budget });
+                  } catch (error) {
+                    Alert.alert("Couldn't save the budget", error instanceof Error ? error.message : "Try again.");
+                  }
+                }}
+              />
               <SettleUpCard
+                trip={trip}
                 plan={ledger.settlementPlan()}
                 view={view}
                 rateInfo={rateInfo}
                 name={name}
                 me={me}
+                userId={user?.id}
                 showDirect={showDirect}
                 onToggleDirect={() => setShowDirect((v) => !v)}
+                onRecord={(settlement) => saveSettlement(trip.id, settlement)}
+                onDelete={(settlementId) => deleteSettlement(trip.id, settlementId)}
+                initialTransfer={paymentRequest}
               />
+              <TripExportCard trip={trip} ledger={ledger} />
               <Card>
                 <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
                   <Text style={styles.h2}>People</Text>
@@ -350,18 +410,23 @@ function TripContent({ trip, ledger }: { trip: Trip; ledger: Ledger }) {
                         key={m.id}
                         label={`${m.name}${ownerBadge}${currencySuffix}`}
                         selected={m.id === me}
+                        accessibilityLabel={
+                          `${m.name}${isOwner ? ", trip owner" : ""}${m.homeCurrency ? `, home currency ${m.homeCurrency}` : ""}`
+                        }
+                        accessibilityHint={m.id === me ? "This is you" : "Select this person as you"}
                         onPress={() => void claimTripMember(trip.id, m.id, user?.id ? {
                           id: user.id, email: user.email, avatarUrl: authAvatar,
                         } : undefined).catch((error) => Alert.alert("Couldn’t select member", error instanceof Error ? error.message : "Try again while online."))}
                       />
                     );
                   })}
-                  <Chip label="+ Add" selected={false} onPress={() => setAdding(true)} />
+                  <Chip label="+ Add" selected={false} accessibilityLabel="Add a person to this trip" onPress={() => setAdding(true)} />
                 </View>
                 {adding && (
                   <View style={{ flexDirection: "row", gap: 8 }}>
                     <Input
                       autoFocus
+                      accessibilityLabel="New member name"
                       placeholder="Name"
                       value={newMember}
                       onChangeText={setNewMember}
@@ -443,8 +508,16 @@ const ExpenseRow = memo(function ExpenseRow({
   last: boolean;
 }) {
   const { colors, styles } = useTheme();
+  const amountText = formatMoney(e.amount, e.currency);
+  const convertedText = e.currency !== view.currency ? formatMoney(view.convert(baseAmount(e)), view.currency) : undefined;
   return (
     <Pressable
+      accessibilityRole="button"
+      accessibilityLabel={
+        `${e.description || "Expense"}, ${amountText}${convertedText ? `, about ${convertedText}` : ""}, ` +
+        `paid by ${payer} on ${e.date}${e.receipt ? `, receipt in ${e.receipt.language}` : ""}`
+      }
+      accessibilityHint="Opens this expense for editing"
       style={[
         styles.row,
         {
@@ -466,6 +539,7 @@ const ExpenseRow = memo(function ExpenseRow({
         <Text style={[styles.muted, { fontSize: 13 }]}>
           {payer} paid · {e.date}
           {e.receipt ? ` · 🧾 ${e.receipt.language}` : ""}
+          {e.rateSource ? ` · rate: ${e.rateSource}` : ""}
         </Text>
         {e.needsReview && (
           <Text style={{ color: colors.warning, fontSize: 13 }}>Read from a photo · tap to check the split</Text>
@@ -485,74 +559,4 @@ const ExpenseRow = memo(function ExpenseRow({
 function withOriginal(view: HomeCurrencyView, tripAmount: number) {
   const { main, original } = view.format(tripAmount);
   return original ? `${main} (${original})` : main;
-}
-
-function SettleUpCard({
-  plan,
-  view,
-  rateInfo,
-  name,
-  me,
-  showDirect,
-  onToggleDirect,
-}: {
-  plan: SettlementPlan;
-  view: HomeCurrencyView;
-  rateInfo: string | null;
-  name: (memberId: string) => string;
-  me?: string;
-  showDirect: boolean;
-  onToggleDirect: () => void;
-}) {
-  const { colors, styles } = useTheme();
-  const row = (t: Transfer, i: number, dim = false) => (
-    <Text key={i} style={{ paddingVertical: 6, color: dim ? colors.muted : colors.text }}>
-      <Text style={{ fontWeight: dim ? "400" : "600" }}>{t.from === me ? "You" : name(t.from)}</Text>
-      {t.from === me ? " pay " : " pays "}
-      <Text style={{ fontWeight: dim ? "400" : "600" }}>{t.to === me ? "you" : name(t.to)}</Text>{" "}
-      {withOriginal(view, t.amount)}
-    </Text>
-  );
-
-  return (
-    <Card>
-      <Text style={styles.h2}>Settle up</Text>
-      {plan.transfers.length === 0 ? (
-        <Text style={styles.muted}>Everyone is square. 🎉</Text>
-      ) : (
-        <>
-          {plan.transfers.map((t, i) => row(t, i))}
-          <Text style={{ marginTop: 6, fontWeight: "600", color: colors.positive }}>
-            {plan.saved > 0
-              ? `Simplified: ${plan.transfers.length} payment${plan.transfers.length === 1 ? "" : "s"} instead of ${plan.direct.length}`
-              : `${plan.transfers.length} payment${plan.transfers.length === 1 ? "" : "s"} — already the fewest possible`}
-          </Text>
-        </>
-      )}
-      {plan.saved > 0 && (
-        <>
-          <Pressable onPress={onToggleDirect} style={{ marginTop: 10 }}>
-            <Text style={styles.link}>
-              {showDirect ? "Hide" : "Show"} who owes whom without simplifying
-            </Text>
-          </Pressable>
-          {showDirect && (
-            <View style={{ marginTop: 6 }}>
-              {plan.direct.map((t, i) => row(t, i, true))}
-              <Text style={[styles.muted, { fontSize: 12, marginTop: 4 }]}>
-                Debts that pass through someone (A owes B, B owes C) are combined so money
-                goes straight to the person who is owed.
-              </Text>
-            </View>
-          )}
-        </>
-      )}
-      <Text style={[styles.muted, { marginTop: 8, fontSize: 12 }]}>
-        Amounts use the exchange rate locked in on each expense.
-        {view.translated &&
-          ` The group settles up in ${view.tripCurrency}; ${view.home} figures use today's rate` +
-            (rateInfo ? ` (${rateInfo}).` : ".")}
-      </Text>
-    </Card>
-  );
 }

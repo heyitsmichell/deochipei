@@ -7,12 +7,16 @@ import {
 } from "./settlement";
 import { computeShares, shareWeights } from "./split";
 import { isISODate } from "./receiptScan";
-import type { Expense, Trip } from "./types";
+import type { Expense, Settlement, Trip } from "./types";
 
 export interface Balance {
   memberId: string;
   paid: number;
   owed: number;
+  /** Payments this member has sent to others. */
+  settledOut: number;
+  /** Payments this member has received from others. */
+  settledIn: number;
   /** Positive: is owed money. Negative: owes money. */
   net: number;
 }
@@ -51,6 +55,8 @@ export class Ledger {
   private readonly known: Set<string>;
   private readonly paid = new Map<string, number>();
   private readonly owed = new Map<string, number>();
+  private readonly settledOut = new Map<string, number>();
+  private readonly settledIn = new Map<string, number>();
   /** debtor → creditor → amount, in minor units. */
   private readonly debts = new Map<string, Map<string, number>>();
   private plan?: SettlementPlan;
@@ -63,11 +69,18 @@ export class Ledger {
     this.memberIds = trip.members.map((m) => m.id);
     this.known = new Set(this.memberIds);
     for (const e of trip.expenses) this.record(e);
+    for (const settlement of trip.settlements ?? []) this.recordSettlement(settlement);
   }
 
   get totalSpent(): number {
     let total = 0;
     for (const v of this.paid.values()) total += v;
+    return this.major(total);
+  }
+
+  get totalSettled(): number {
+    let total = 0;
+    for (const v of this.settledOut.values()) total += v;
     return this.major(total);
   }
 
@@ -78,11 +91,15 @@ export class Ledger {
   balanceOf(memberId: string): Balance {
     const paid = this.paid.get(memberId) ?? 0;
     const owed = this.owed.get(memberId) ?? 0;
+    const settledOut = this.settledOut.get(memberId) ?? 0;
+    const settledIn = this.settledIn.get(memberId) ?? 0;
     return {
       memberId,
       paid: this.major(paid),
       owed: this.major(owed),
-      net: this.major(paid - owed),
+      settledOut: this.major(settledOut),
+      settledIn: this.major(settledIn),
+      net: this.major(paid - owed + settledOut - settledIn),
     };
   }
 
@@ -111,6 +128,25 @@ export class Ledger {
       this.owed.set(id, (this.owed.get(id) ?? 0) + share);
       if (id !== e.paidBy) this.addDebt(id, e.paidBy, share);
     }
+  }
+
+  private recordSettlement(s: Settlement) {
+    if (!s || typeof s.id !== "string" || !s.id || !s.from || !s.to || s.from === s.to ||
+        !Number.isFinite(s.amount) || s.amount <= 0 || s.currency !== this.currency) {
+      throw new Error(`Invalid settlement ${s?.id ?? "unknown"}`);
+    }
+    const total = toMinor(s.amount, this.currency);
+    if (total <= 0) throw new Error(`Invalid settlement ${s.id}`);
+    this.track(s.from);
+    this.track(s.to);
+    this.settledOut.set(s.from, (this.settledOut.get(s.from) ?? 0) + total);
+    this.settledIn.set(s.to, (this.settledIn.get(s.to) ?? 0) + total);
+    // Keep the "who owes whom" view honest: a payment cancels what the payer
+    // owed, and an overpayment turns into a debt in the other direction.
+    const owed = this.debt(s.from, s.to);
+    const offset = Math.min(owed, total);
+    this.setDebt(s.from, s.to, owed - offset);
+    if (total > offset) this.addDebt(s.to, s.from, total - offset);
   }
 
   /** Expenses can reference someone whose member record hasn't synced yet. */
@@ -142,7 +178,8 @@ export class Ledger {
   private netBalances(): NetBalance[] {
     return this.memberIds.map((memberId) => ({
       memberId,
-      minor: (this.paid.get(memberId) ?? 0) - (this.owed.get(memberId) ?? 0),
+      minor: (this.paid.get(memberId) ?? 0) - (this.owed.get(memberId) ?? 0) +
+        (this.settledOut.get(memberId) ?? 0) - (this.settledIn.get(memberId) ?? 0),
     }));
   }
 
@@ -173,6 +210,8 @@ export interface InvalidExpense {
   id?: string;
   description: string;
   value: unknown;
+  /** Distinguishes a damaged payment from a damaged expense in the repair screen. */
+  kind?: "expense" | "settlement";
 }
 
 function invalidExpense(value: unknown, index: number): InvalidExpense {
@@ -180,6 +219,14 @@ function invalidExpense(value: unknown, index: number): InvalidExpense {
   return { index, value,
     id: typeof record?.id === "string" && record.id ? record.id : undefined,
     description: typeof record?.description === "string" ? record.description : "",
+  };
+}
+
+function invalidSettlement(value: unknown, index: number): InvalidExpense {
+  const record = value && typeof value === "object" ? value as Partial<Settlement> : undefined;
+  return { kind: "settlement", index, value,
+    id: typeof record?.id === "string" && record.id ? record.id : undefined,
+    description: typeof record?.note === "string" ? record.note : "Payment",
   };
 }
 
@@ -194,10 +241,27 @@ export function inspectLedger(trip: Trip): { ledger?: Ledger; invalid: InvalidEx
         invalid.push(invalidExpense(expense, index));
         return;
       }
-      new Ledger({ ...trip, expenses: [expense] });
+      new Ledger({ ...trip, expenses: [expense], settlements: [] });
     } catch { invalid.push(invalidExpense(expense, index)); }
+  });
+  (trip.settlements ?? []).forEach((settlement, index) => {
+    try {
+      if (!settlement || typeof settlement.id !== "string" || !settlement.id ||
+          !isISODate(settlement.date) || !settlement.from || !settlement.to ||
+          !Number.isFinite(settlement.amount) || settlement.amount <= 0 ||
+          !/^[A-Z]{3}$/.test(settlement.currency)) {
+        invalid.push(invalidSettlement(settlement, index));
+        return;
+      }
+      new Ledger({ ...trip, expenses: [], settlements: [settlement] });
+    } catch { invalid.push(invalidSettlement(settlement, index)); }
   });
   if (invalid.length) return { invalid };
   try { return { ledger: new Ledger(trip), invalid }; }
-  catch { return { invalid: trip.expenses.map(invalidExpense) }; }
+  catch {
+    return { invalid: [
+      ...trip.expenses.map(invalidExpense),
+      ...(trip.settlements ?? []).map(invalidSettlement),
+    ] };
+  }
 }

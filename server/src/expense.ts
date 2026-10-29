@@ -20,6 +20,7 @@ export const ExpenseSchema = z.looseObject({
   split: z.discriminatedUnion("type", [
     z.object({ type: z.literal("equal"), memberIds: ids }),
     z.object({ type: z.literal("items"), memberIds: ids, assignments: z.record(z.string().regex(/^(0|[1-9]\d*)$/), z.array(z.string().min(1))) }),
+    z.object({ type: z.literal("shares"), memberIds: ids, weights: z.record(z.string().min(1), z.number().finite().positive()) }),
   ]),
   receipt: z.object({
     merchant: z.string().nullable(), merchantTranslated: z.string().nullable(),
@@ -41,5 +42,25 @@ export const ExpenseSchema = z.looseObject({
     if (!Number.isSafeInteger(Number(index)) || Number(index) >= items.length) {
       ctx.addIssue({ code: "custom", path: ["split", "assignments", index], message: "Assignment must reference a receipt item" });
     }
+  }
+});
+
+/** A payment between two members. Amounts are always in the trip's base currency. */
+export const SettlementSchema = z.looseObject({
+  id: z.string().min(1),
+  from: z.string().min(1),
+  to: z.string().min(1),
+  amount: z.number().finite().positive(),
+  currency,
+  date,
+  method: z.string().max(40).optional(),
+  note: z.string().max(500).optional(),
+  createdBy: z.string().optional(),
+  createdAt: z.number().finite(),
+  updatedAt: z.number().finite(),
+  revision: z.number().int().nonnegative().optional(),
+}).superRefine((settlement, ctx) => {
+  if (settlement.from === settlement.to) {
+    ctx.addIssue({ code: "custom", path: ["to"], message: "A payment needs two different people" });
   }
 });

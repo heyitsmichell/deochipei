@@ -94,9 +94,18 @@ const TripCard = memo(function TripCard({ trip }: { trip: Trip }) {
   const spent = ledger?.totalSpent;
   const total = view.format(spent ?? 0);
   return (
-    <Pressable onPress={() => router.push(`/trip/${trip.id}`)}>
+    <Pressable
+      accessibilityRole="button"
+      accessibilityLabel={
+        `${trip.name}. ${trip.members.map((m) => m.name).join(", ")}. ` +
+        (ledger ? `${total.main}${total.original ? `, ${total.original}` : ""}, ${trip.expenses.length} expenses` : "Needs correction") +
+        (queued > 0 ? `. ${queued} ${queued === 1 ? "receipt" : "receipts"} waiting to be read` : "")
+      }
+      accessibilityHint="Opens this trip"
+      onPress={() => router.push(`/trip/${trip.id}`)}
+    >
       <Card>
-        <Text style={styles.h2}>{trip.name}</Text>
+        <Text style={styles.h2} accessibilityRole="header">{trip.name}</Text>
         <Text style={styles.muted}>{trip.members.map((m) => m.name).join(", ")}</Text>
         <Text style={{ marginTop: 8, fontWeight: "600", color: colors.text }}>
           {ledger ? total.main : "Needs correction"} · {trip.expenses.length} expenses
