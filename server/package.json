@@ -26,5 +26,8 @@
   "type": "module",
   "optionalDependencies": {
     "@esbuild/darwin-arm64": "^0.28.2"
+  },
+  "engines": {
+    "node": ">=22.13"
   }
 }

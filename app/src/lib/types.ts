@@ -67,6 +67,12 @@ export interface Expense {
   needsReview?: boolean;
   createdAt: number;
   updatedAt: number;
+  /**
+   * Server-owned version of this expense. An edit sends back the revision it
+   * started from so the server can refuse it if someone else saved in between.
+   * Never set on the device; absent for expenses the server hasn't seen yet.
+   */
+  revision?: number;
 }
 
 export interface Trip {

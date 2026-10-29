@@ -18,6 +18,21 @@ export type Op =
   | ({ kind: "upsertExpense"; tripId: string; expense: Expense } & OpMeta)
   | ({ kind: "deleteExpense"; tripId: string; expenseId: string } & OpMeta);
 
+/**
+ * An edit made here that the server refused because someone else changed (or
+ * deleted) the same expense after this device last saw it. It waits for the
+ * person to choose between the two versions; nothing is overwritten silently.
+ */
+export interface ExpenseConflict {
+  tripId: string;
+  expenseId: string;
+  /** This device's version (its latest edit, when several were queued). */
+  mine: Expense;
+  /** The server's version, or null if the expense was deleted meanwhile. */
+  theirs: Expense | null;
+  detectedAt: number;
+}
+
 export interface Settings {
   receiptLanguage: string;
   /** The currency this person reads totals and balances in. */
@@ -37,6 +52,8 @@ export interface PersistedData {
   ops: Op[];
   /** Operations rejected permanently; retained for diagnostics without blocking later work. */
   failedOps: Op[];
+  /** Expense edits waiting for a person to pick a side; see ExpenseConflict. */
+  conflicts?: ExpenseConflict[];
   /** Which member is "me" on this device, per trip. */
   me: Record<string, string>;
   settings: Settings;
@@ -277,6 +294,19 @@ export class TripRepository {
 
   hasUnverifiedTrip = (tripId: string) => !!this.data.unverified?.trips[tripId];
 
+  conflictsFor = (tripId: string) => (this.data.conflicts ?? []).filter((c) => c.tripId === tripId);
+
+  /**
+   * The server's newer copy of an expense when the edit about to be saved started
+   * from an older one (it was synced into this phone while the form was open).
+   * Lets the form warn before queueing a write that would be refused anyway.
+   */
+  staleExpense = (tripId: string, edited: Expense): Expense | undefined => {
+    const current = this.data.trips[tripId]?.expenses.find((e) => e?.id === edited.id);
+    if (!current || current.revision == null || edited.revision == null) return undefined;
+    return current.revision === edited.revision ? undefined : current;
+  };
+
   pendingCount = (tripId: string) => this.data.ops.filter((o) => o.tripId === tripId).length;
   failedCount = (tripId: string) => this.data.failedOps.filter((o) => o.tripId === tripId).length;
 
@@ -500,9 +530,30 @@ export class TripRepository {
   saveExpense = (tripId: string, expense: Expense) => {
     const trip = this.data.trips[tripId];
     if (!trip) return;
+    // `expense.revision` is the server version this edit started from; it rides along to the server.
     const updated = { ...expense, updatedAt: Date.now() };
     this.update((d) => ({ ...d, trips: { ...d.trips, [tripId]: applyOp(trip, { kind: "upsertExpense", tripId, expense: updated }) } }));
     if (trip.syncEnabled) this.enqueue({ kind: "upsertExpense", tripId, expense: updated });
+  };
+
+  /**
+   * Settles a conflict. "theirs" accepts the server's version (this device
+   * already shows it). "mine" saves this device's version on top of the current
+   * server copy; if the expense was deleted it comes back as a new expense,
+   * because a deleted id can't be reused.
+   */
+  resolveConflict = (tripId: string, expenseId: string, choice: "mine" | "theirs") => {
+    const conflict = this.data.conflicts?.find((c) => c.tripId === tripId && c.expenseId === expenseId);
+    if (!conflict) return;
+    this.update((d) => ({ ...d, conflicts: (d.conflicts ?? []).filter((c) => c !== conflict) }));
+    if (choice === "theirs") return;
+    const { revision: _stale, ...mine } = conflict.mine;
+    const current = this.data.trips[tripId]?.expenses.find((e) => e?.id === expenseId);
+    if (conflict.theirs === null || !current) {
+      this.saveExpense(tripId, { ...mine, id: newId(), createdAt: Date.now() });
+    } else {
+      this.saveExpense(tripId, { ...mine, ...(current.revision != null ? { revision: current.revision } : {}) });
+    }
   };
 
   deleteExpense = (tripId: string, expenseId: string) => {
@@ -581,6 +632,7 @@ export class TripRepository {
         } } : {}),
         ops: d.ops.filter((o) => o.tripId !== tripId),
         failedOps: d.failedOps.filter((o) => o.tripId !== tripId),
+        conflicts: (d.conflicts ?? []).filter((c) => c.tripId !== tripId),
       };
     });
 
@@ -721,10 +773,16 @@ export class TripRepository {
         const server = await this.send(op);
         if (epoch !== this.epoch) return;
         this.dropOp(op);
+        if (op.kind === "upsertExpense") this.rebaseQueuedEdits(op, server);
         this.adopt(server);
         this.setOnline(true);
       } catch (err) {
         if (epoch !== this.epoch) return;
+        if (err instanceof ApiError && err.isExpenseConflict && op.kind === "upsertExpense") {
+          this.recordConflict(op, err);
+          this.setOnline(true);
+          continue;
+        }
         if (err instanceof ApiError && err.isPermanent) {
           console.warn("Parking rejected op", op.kind, err.message);
           this.parkOp(op);
@@ -767,6 +825,52 @@ export class TripRepository {
       case "deleteExpense":
         return this.api.deleteExpense(op.tripId, op.expenseId);
     }
+  }
+
+  /**
+   * After an edit lands, later queued edits of the same expense were made on top
+   * of it, so they start from the revision the server just assigned. Without this
+   * the second of two offline edits would be refused as stale by the first.
+   */
+  private rebaseQueuedEdits(sent: Extract<Op, { kind: "upsertExpense" }>, server: Trip) {
+    const revision = server.expenses.find((e) => e?.id === sent.expense.id)?.revision;
+    if (revision == null) return;
+    this.update((d) => ({
+      ...d,
+      ops: d.ops.map((o) =>
+        o.kind === "upsertExpense" && o.tripId === sent.tripId && o.expense.id === sent.expense.id
+          ? { ...o, expense: { ...o.expense, revision } }
+          : o,
+      ),
+    }));
+  }
+
+  /** The server refused an edit as stale: set it aside for review and show the server's copy. */
+  private recordConflict(op: Extract<Op, { kind: "upsertExpense" }>, err: ApiError) {
+    const isSame = (o: Op) => o.tripId === op.tripId && (o.kind === "upsertExpense" ? o.expense.id : o.kind === "deleteExpense" ? o.expenseId : undefined) === op.expense.id;
+    const rest = this.data.ops.filter((o) => o !== op && isSame(o));
+    const deletedLater = rest.some((o) => o.kind === "deleteExpense");
+    const edits = [op, ...rest.filter((o): o is Extract<Op, { kind: "upsertExpense" }> => o.kind === "upsertExpense")];
+    const raw = err.currentExpense as Expense | null;
+    const theirs = raw && typeof raw === "object" && typeof raw.id === "string" ? raw : null;
+    // The latest edit holds everything done on this device (each edit is a full copy).
+    const mine = edits[edits.length - 1].expense;
+    this.update((d) => {
+      const trip = d.trips[op.tripId];
+      const ops = d.ops.filter((o) => !edits.some((edit) => edit === o));
+      // The user went on to delete it after editing: the delete wins, no review needed.
+      if (deletedLater || !trip) return { ...d, ops };
+      const shown = theirs
+        ? applyOp(trip, { kind: "upsertExpense", tripId: op.tripId, expense: theirs })
+        : applyOp(trip, { kind: "deleteExpense", tripId: op.tripId, expenseId: op.expense.id });
+      const others = (d.conflicts ?? []).filter((c) => !(c.tripId === op.tripId && c.expenseId === op.expense.id));
+      return {
+        ...d,
+        ops,
+        trips: { ...d.trips, [op.tripId]: shown },
+        conflicts: [...others, { tripId: op.tripId, expenseId: op.expense.id, mine, theirs, detectedAt: Date.now() }],
+      };
+    });
   }
 
   private enqueue(op: Op) {

@@ -4,14 +4,22 @@ import OpenAI from "openai";
 import { z } from "zod";
 import { ExpenseSchema } from "./expense.js";
 import { requireAuth } from "./auth.js";
+import { allowedOrigin } from "./cors.js";
 import { DuplicateCheckSchema, judgeDuplicate } from "./duplicates.js";
 import { androidAssetLinks, appleAppSiteAssociation, invitePage, isValidInviteCode } from "./invite.js";
 import { NimNotConfiguredError } from "./nim.js";
+import { parseTrustProxy, RateLimiter } from "./ratelimit.js";
 import { NotAReceiptError, ScanRefusedError, scanReceipt } from "./receipt.js";
-import { canEditExpense, TripStore, type Trip } from "./store.js";
+import { canEditExpense, ExpenseConflictError, TripStore, type Trip } from "./store.js";
 
-const store = new TripStore(path.resolve("data", "trips.json"));
+// DATA_DIR must be on a persistent volume in production. An old trips.json in it is imported once.
+const dbFile = path.resolve(process.env.DATA_DIR ?? "data", "trips.db");
+const store = new TripStore(dbFile);
 const app = express();
+
+// Behind a load balancer set TRUST_PROXY (e.g. 1) so per-IP limits see real client
+// addresses instead of lumping everyone under the balancer's.
+app.set("trust proxy", parseTrustProxy(process.env.TRUST_PROXY));
 
 // Harden headers to reduce browser-side leaks and clickjacking risk.
 app.disable("x-powered-by");
@@ -21,9 +29,13 @@ app.use((req: Request, res: Response, next: NextFunction) => {
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("X-Frame-Options", "DENY");
   res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, If-None-Match");
+  const origin = allowedOrigin(req.headers.origin);
+  if (origin) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    if (origin !== "*") res.vary("Origin");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, If-None-Match");
+  }
   if (req.method === "OPTIONS") {
     return res.sendStatus(204);
   }
@@ -34,72 +46,55 @@ app.use((req: Request, res: Response, next: NextFunction) => {
 // parser only after authentication has succeeded.
 const smallJson = express.json({ limit: "256kb" });
 
-// Simple in-memory limiter for AI requests.
-interface RateLimitEntry {
-  timestamps: number[];
-}
-const aiRateLimitMap = new Map<string, RateLimitEntry>();
-const joinRateLimitMap = new Map<string, RateLimitEntry>();
+// Rate limits live in the same SQLite file as the trips, so they survive restarts
+// and are shared by every server process on that volume.
+const rateLimiter = new RateLimiter(dbFile);
 
-export function createAiRateLimiter(options: { windowMs: number; max: number; message: string }) {
-  const { windowMs, max, message } = options;
+export function createRateLimiter(options: {
+  bucket: string;
+  windowMs: number;
+  max: number;
+  message: string;
+  /** Count per signed-in user when there is one, otherwise per client IP. */
+  perUser?: boolean;
+}) {
+  const { bucket, windowMs, max, message, perUser } = options;
   return (req: Request, res: Response, next: NextFunction) => {
-    const key = req.user?.id
-      ? `user:${req.user.id}`
-      : `ip:${req.ip || req.socket.remoteAddress || "127.0.0.1"}`;
-    const now = Date.now();
-    for (const [storedKey, stored] of aiRateLimitMap) {
-      if (!stored.timestamps.some((t) => now - t < windowMs)) aiRateLimitMap.delete(storedKey);
+    const ip = `ip:${req.ip || req.socket.remoteAddress || "unknown"}`;
+    const key = perUser && req.user?.id ? `user:${req.user.id}` : ip;
+    let decision;
+    try {
+      decision = rateLimiter.hit(bucket, key, windowMs, max);
+    } catch (error) {
+      // A broken limiter shouldn't take the API down with it; the failure is logged loudly.
+      console.error(`Rate limiter unavailable, allowing ${bucket} request`, error);
+      return next();
     }
-    let entry = aiRateLimitMap.get(key);
-    if (!entry) {
-      entry = { timestamps: [] };
-      aiRateLimitMap.set(key, entry);
+    if (!decision.allowed) {
+      res.setHeader("Retry-After", String(decision.retryAfterSec));
+      return res.status(429).json({ error: message });
     }
-    entry.timestamps = entry.timestamps.filter((t) => now - t < windowMs);
-    if (entry.timestamps.length >= max) {
-      const oldest = entry.timestamps[0];
-      const retryAfterSec = Math.max(1, Math.ceil((oldest + windowMs - now) / 1000));
-      res.setHeader("Retry-After", String(retryAfterSec));
-      res.status(429).json({ error: message });
-      return;
-    }
-    entry.timestamps.push(now);
-    if (entry.timestamps.length === 1) aiRateLimitMap.set(key, entry);
-    next();
+    return next();
   };
 }
 
-export const aiRateLimiter = createAiRateLimiter({
+export const aiRateLimiter = createRateLimiter({
+  bucket: "ai",
+  perUser: true,
   windowMs: 60_000,
   max: 20,
   message: "Too many scans right now, try again in a minute.",
 });
 
-export function resetRateLimits(): void {
-  aiRateLimitMap.clear();
-  joinRateLimitMap.clear();
-}
+const joinRateLimiter = createRateLimiter({
+  bucket: "join",
+  windowMs: 60_000,
+  max: 30,
+  message: "Too many invite lookups. Try again shortly.",
+});
 
-function joinRateLimiter(req: Request, res: Response, next: NextFunction) {
-  const key = req.ip || req.socket.remoteAddress || "127.0.0.1";
-  const now = Date.now();
-  for (const [storedKey, stored] of joinRateLimitMap) {
-    stored.timestamps = stored.timestamps.filter((timestamp) => now - timestamp < 60_000);
-    if (!stored.timestamps.length) joinRateLimitMap.delete(storedKey);
-  }
-  let entry = joinRateLimitMap.get(key);
-  if (!entry) {
-    entry = { timestamps: [] };
-    joinRateLimitMap.set(key, entry);
-  }
-  entry.timestamps = entry.timestamps.filter((timestamp) => now - timestamp < 60_000);
-  if (entry.timestamps.length >= 30) {
-    res.setHeader("Retry-After", "60");
-    return res.status(429).json({ error: "Too many invite lookups. Try again shortly." });
-  }
-  entry.timestamps.push(now);
-  return next();
+export function resetRateLimits(): void {
+  rateLimiter.reset();
 }
 
 // Check that the required environment variables are present on startup.
@@ -163,11 +158,7 @@ app.use("/api/trips", requireAuth, smallJson);
 
 app.get("/api/trips", requireAuth, (req: Request, res: Response) => {
   const userId = req.user!.id;
-  const allTrips: Trip[] = store.list();
-  const userTrips = allTrips.filter(
-    (t) => t.ownerId === userId || t.members.some((m) => m.userId === userId)
-  );
-  res.json(userTrips);
+  res.json(store.listForUser(userId));
 });
 
 app.post("/api/trips", requireAuth, async (req: Request, res: Response) => {
@@ -341,6 +332,10 @@ app.put("/api/trips/:id/expenses/:expenseId", requireAuth, async (req: Request, 
   const expenseId = extractParam(req.params.expenseId);
   const body = ExpenseSchema.safeParse({ ...req.body, id: expenseId });
   if (!body.success) return res.status(400).json({ error: body.error.message });
+  // The revision the editor started from. Optional so older apps keep working.
+  const base = z.number().int().min(0).optional().safeParse(req.body?.baseRevision);
+  if (!base.success) return res.status(400).json({ error: "baseRevision must be a non-negative integer" });
+  const baseRevision = base.data;
 
   const id = extractParam(req.params.id);
   const trip = store.get(id);
@@ -357,9 +352,22 @@ app.put("/api/trips/:id/expenses/:expenseId", requireAuth, async (req: Request, 
     return res.status(403).json({ error: "Only the expense creator or trip owner can edit this expense" });
   }
   body.data.createdBy = existing?.createdBy ?? req.user!.id;
+  // revision is assigned by the server, never taken from the client.
+  delete (body.data as Record<string, unknown>).revision;
 
-  const updated = await store.upsertExpense(id, body.data);
-  return updated ? res.json(updated) : notFound(res);
+  try {
+    const updated = await store.upsertExpense(id, body.data, baseRevision);
+    return updated ? res.json(updated) : notFound(res);
+  } catch (err) {
+    if (err instanceof ExpenseConflictError) {
+      return res.status(409).json({
+        error: err.message,
+        code: err.reason === "deleted" ? "expense_deleted" : "expense_conflict",
+        current: err.current ?? null,
+      });
+    }
+    throw err;
+  }
 });
 
 app.delete("/api/trips/:id/expenses/:expenseId", requireAuth, async (req: Request, res: Response) => {
@@ -510,13 +518,36 @@ app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
   res.status(500).json({ error: "Internal server error" });
 });
 
-export { app };
+export { app, store, rateLimiter };
 
 const port = Number(process.env.PORT ?? 4000);
 await store.load();
 if (process.env.NODE_ENV !== "test") {
   validateEnv();
-  app.listen(port, "0.0.0.0", () => {
+  const server = app.listen(port, "0.0.0.0", () => {
     console.log(`Deochipei API listening on http://0.0.0.0:${port}`);
   });
+
+  // Let in-flight requests finish and flush the database before the process
+  // goes away (deploys and container stops send SIGTERM).
+  let stopping = false;
+  const shutdown = (signal: string) => {
+    if (stopping) return;
+    stopping = true;
+    console.log(`${signal} received, shutting down`);
+    const force = setTimeout(() => {
+      store.close();
+      rateLimiter.close();
+      process.exit(1);
+    }, 10_000);
+    force.unref();
+    server.close(() => {
+      store.close();
+      rateLimiter.close();
+      process.exit(0);
+    });
+    server.closeIdleConnections();
+  };
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
 }

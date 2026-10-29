@@ -57,7 +57,7 @@ async function request<T>(path: string, init?: RequestInit & { timeoutMs?: numbe
     // Only a conditional GET (getTrip with a known version) gets this, and it has no body.
     if (res.status === 304) return null as T;
     const body = await res.json().catch(() => ({}));
-    if (!res.ok) throw new ApiError(body.error ?? `Request failed (${res.status})`, res.status, body.retryable);
+    if (!res.ok) throw new ApiError(body.error ?? `Request failed (${res.status})`, res.status, body.retryable, body);
     return body as T;
   } finally {
     clearTimeout(timer);
@@ -92,7 +92,11 @@ const legacyApi = {
   patchTrip: (id: string, patch: Partial<Pick<Trip, "name" | "baseCurrency">>) =>
     request<Trip>(`/api/trips/${id}`, { method: "PATCH", body: JSON.stringify(patch) }),
   upsertMember: (id: string, m: Member) => request<Trip>(`/api/trips/${id}/members/${m.id}`, put(m)),
-  upsertExpense: (id: string, e: Expense) => request<Trip>(`/api/trips/${id}/expenses/${e.id}`, put(e)),
+  // `revision` is what this edit started from; the server refuses the write (409) if it has moved on.
+  upsertExpense: (id: string, e: Expense) => {
+    const { revision, ...rest } = e;
+    return request<Trip>(`/api/trips/${id}/expenses/${e.id}`, put(revision != null ? { ...rest, baseRevision: revision } : rest));
+  },
   deleteExpense: (id: string, expenseId: string) =>
     request<Trip>(`/api/trips/${id}/expenses/${expenseId}`, { method: "DELETE" }),
   scanReceipt: (imageBase64: string, targetLanguage: string) =>

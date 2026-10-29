@@ -581,3 +581,156 @@ test("only a successful claim clears a removed trip marker", async () => {
   assert.deepEqual(repo.getSnapshot().data.removedTripIds!.owner, []);
   assert.equal(repo.meFor("trip"), "b");
 });
+
+// ── Conflict handling: edits carry the revision they started from ─────────
+
+const conflictError = (current: Expense | null) =>
+  new ApiError("This expense was changed by someone else.", 409, false, { code: current ? "expense_conflict" : "expense_deleted", current });
+
+test("a stale edit is set aside for review, and the server's version is shown meanwhile", async () => {
+  const theirs = expense({ description: "Their edit", amount: 12, revision: 7 });
+  const sent: Expense[] = [];
+  const { repo } = await repository({
+    upsertExpense: async (_id, e) => { sent.push(e); throw conflictError(theirs); },
+    getTrip: async () => null,
+  }, trip({ expenses: [expense({ revision: 5 })] }));
+
+  repo.saveExpense("trip", expense({ description: "My edit", amount: 20, revision: 5 }));
+  await repo.flush();
+
+  assert.equal(sent[0].revision, 5, "the edit is sent with the revision it started from");
+  assert.equal(repo.failedCount("trip"), 0, "a conflict is not a rejected change");
+  assert.equal(repo.pendingCount("trip"), 0);
+  const [conflict] = repo.conflictsFor("trip");
+  assert.equal(conflict.mine.description, "My edit");
+  assert.equal(conflict.theirs?.description, "Their edit");
+  assert.equal(repo.getTrip("trip")!.expenses[0].description, "Their edit");
+});
+
+test("keeping mine re-sends my version on top of the current server revision", async () => {
+  const theirs = expense({ description: "Their edit", revision: 7 });
+  let attempts = 0;
+  const sent: Expense[] = [];
+  const { repo } = await repository({
+    upsertExpense: async (_id, e) => {
+      sent.push(e);
+      if (attempts++ === 0) throw conflictError(theirs);
+      return trip({ revision: 9, expenses: [{ ...e, revision: 9 }] });
+    },
+    getTrip: async () => null,
+  }, trip({ expenses: [expense({ revision: 5 })] }));
+  repo.saveExpense("trip", expense({ description: "My edit", revision: 5 }));
+  await repo.flush();
+  repo.resolveConflict("trip", "expense", "mine");
+  await repo.flush();
+  assert.equal(repo.conflictsFor("trip").length, 0);
+  assert.equal(sent[1].description, "My edit");
+  assert.equal(sent[1].revision, 7, "second try starts from the server's current revision");
+  assert.equal(repo.getTrip("trip")!.expenses[0].description, "My edit");
+});
+
+test("using theirs drops my edit and sends nothing", async () => {
+  const theirs = expense({ description: "Their edit", revision: 7 });
+  let calls = 0;
+  const { repo } = await repository({ upsertExpense: async () => { calls++; throw conflictError(theirs); }, getTrip: async () => null },
+    trip({ expenses: [expense({ revision: 5 })] }));
+  repo.saveExpense("trip", expense({ description: "My edit", revision: 5 }));
+  await repo.flush();
+  repo.resolveConflict("trip", "expense", "theirs");
+  await repo.flush();
+  assert.equal(calls, 1);
+  assert.equal(repo.conflictsFor("trip").length, 0);
+  assert.equal(repo.getTrip("trip")!.expenses[0].description, "Their edit");
+});
+
+test("several offline edits of one expense collapse into a single conflict holding the latest", async () => {
+  const theirs = expense({ description: "Their edit", revision: 7 });
+  let calls = 0;
+  const { repo } = await repository({ upsertExpense: async () => { calls++; throw conflictError(theirs); }, getTrip: async () => null },
+    trip({ expenses: [expense({ revision: 5 })] }));
+  repo.saveExpense("trip", expense({ description: "first", revision: 5 }));
+  repo.saveExpense("trip", expense({ description: "second", revision: 5 }));
+  await repo.flush();
+  assert.equal(calls, 1, "the rest of the queue is not sent against a known-stale base");
+  assert.equal(repo.conflictsFor("trip").length, 1);
+  assert.equal(repo.conflictsFor("trip")[0].mine.description, "second");
+  assert.equal(repo.pendingCount("trip"), 0);
+});
+
+test("editing twice offline does not make the second edit conflict with the first", async () => {
+  const sent: (number | undefined)[] = [];
+  let server = 5;
+  const { repo } = await repository({
+    upsertExpense: async (_id, e) => {
+      sent.push(e.revision);
+      assert.equal(e.revision, server, "base must match what the server holds");
+      server += 1;
+      return trip({ revision: server, expenses: [{ ...e, revision: server }] });
+    },
+    getTrip: async () => null,
+  }, trip({ expenses: [expense({ revision: 5 })] }));
+  repo.saveExpense("trip", expense({ description: "first", revision: 5 }));
+  repo.saveExpense("trip", expense({ description: "second", revision: 5 }));
+  await repo.flush();
+  assert.deepEqual(sent, [5, 6]);
+  assert.equal(repo.conflictsFor("trip").length, 0);
+  assert.equal(repo.getTrip("trip")!.expenses[0].description, "second");
+});
+
+test("an expense deleted by someone else offers restoring mine as a new expense", async () => {
+  const sent: Expense[] = [];
+  let first = true;
+  const { repo } = await repository({
+    upsertExpense: async (_id, e) => {
+      sent.push(e);
+      if (first) { first = false; throw conflictError(null); }
+      return trip({ revision: 9, expenses: [{ ...e, revision: 9 }] });
+    },
+    getTrip: async () => null,
+  }, trip({ expenses: [expense({ revision: 5 })] }));
+  repo.saveExpense("trip", expense({ description: "My edit", revision: 5 }));
+  await repo.flush();
+  assert.equal(repo.conflictsFor("trip")[0].theirs, null);
+  assert.equal(repo.getTrip("trip")!.expenses.length, 0, "the deletion is shown");
+  repo.resolveConflict("trip", "expense", "mine");
+  await repo.flush();
+  assert.notEqual(sent[1].id, "expense", "a deleted id cannot be reused");
+  assert.equal(sent[1].revision, undefined);
+  assert.equal(repo.getTrip("trip")!.expenses[0].description, "My edit");
+});
+
+test("deleting right after a conflicting edit needs no review: the delete wins", async () => {
+  const theirs = expense({ description: "Their edit", revision: 7 });
+  let deleted = 0;
+  const { repo } = await repository({
+    upsertExpense: async () => { throw conflictError(theirs); },
+    deleteExpense: async () => { deleted++; return trip({ revision: 8, expenses: [] }); },
+    getTrip: async () => null,
+  }, trip({ expenses: [expense({ revision: 5 })] }));
+  repo.saveExpense("trip", expense({ description: "My edit", revision: 5 }));
+  repo.deleteExpense("trip", "expense");
+  await repo.flush();
+  assert.equal(deleted, 1);
+  assert.equal(repo.conflictsFor("trip").length, 0);
+});
+
+test("conflicts survive a restart and are cleared with the trip", async () => {
+  const theirs = expense({ description: "Their edit", revision: 7 });
+  const { repo, storage } = await repository({ upsertExpense: async () => { throw conflictError(theirs); }, getTrip: async () => null },
+    trip({ expenses: [expense({ revision: 5 })] }));
+  repo.saveExpense("trip", expense({ description: "My edit", revision: 5 }));
+  await repo.flush();
+  await repo.saved();
+  const reopened = new TripRepository({ listTrips: async () => [] } as unknown as TripApi, storage, "repo");
+  await reopened.ready();
+  assert.equal(reopened.conflictsFor("trip").length, 1);
+  repo.removeTripLocally("trip");
+  assert.equal(repo.conflictsFor("trip").length, 0);
+});
+
+test("staleExpense spots a newer server copy synced in while a form was open", async () => {
+  const { repo } = await repository({}, trip({ expenses: [expense({ revision: 8 })] }));
+  assert.equal(repo.staleExpense("trip", expense({ revision: 5 }))?.revision, 8);
+  assert.equal(repo.staleExpense("trip", expense({ revision: 8 })), undefined);
+  assert.equal(repo.staleExpense("trip", expense()), undefined, "a never-synced expense has nothing to compare");
+});

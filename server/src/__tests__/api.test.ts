@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { once } from "node:events";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
@@ -56,7 +56,7 @@ test("API rejects malformed writes, permits polling preflight, and protects invi
   process.env.SUPABASE_ANON_KEY = "synthetic-test-key";
   const { setSupabaseClientForTesting } = await import("../auth.js");
   setSupabaseClientForTesting({ auth: { getUser: async (token: string) => ({ data: { user: { id: token!, email: `${token}@example.invalid` } }, error: null }) } });
-  const { app } = await import("../index.js");
+  const { app, store, rateLimiter, resetRateLimits } = await import("../index.js");
   const server = app.listen(0, "127.0.0.1");
   await once(server, "listening");
   const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
@@ -73,10 +73,25 @@ test("API rejects malformed writes, permits polling preflight, and protects invi
     assert.equal(create.status, 200);
     const bad = await request("/api/trips/trip/expenses/bad", { amount: 1, updatedAt: 1 }, "PUT", "member");
     assert.equal(bad.status, 400);
-    assert.deepEqual(JSON.parse(await readFile(join(scratch, "data/trips.json"), "utf8"))[0].expenses, []);
+    assert.deepEqual((await request("/api/trips/trip", undefined, "GET", "owner")).body.expenses, []);
     const valid = await request("/api/trips/trip/expenses/expense", expense, "PUT", "member");
     assert.equal(valid.status, 200);
     assert.equal(valid.body.expenses[0].createdBy, "member");
+    // Edits echo the revision they started from; a stale one gets a 409 with the current copy.
+    const saved = valid.body.expenses[0];
+    assert.ok(saved.revision > 0);
+    const mine = await request("/api/trips/trip/expenses/expense", { ...expense, description: "Mine", baseRevision: saved.revision }, "PUT", "member");
+    assert.equal(mine.status, 200);
+    const theirs = await request("/api/trips/trip/expenses/expense", { ...expense, description: "Theirs", baseRevision: saved.revision }, "PUT", "owner");
+    assert.equal(theirs.status, 409);
+    assert.equal(theirs.body.code, "expense_conflict");
+    assert.equal(theirs.body.current.description, "Mine");
+    // A client cannot forge the server's revision.
+    const forged = await request("/api/trips/trip/expenses/expense", { ...expense, revision: 9999 }, "PUT", "member");
+    assert.equal(forged.status, 200);
+    assert.notEqual(forged.body.expenses[0].revision, 9999);
+    const badBase = await request("/api/trips/trip/expenses/expense", { ...expense, baseRevision: "x" }, "PUT", "member");
+    assert.equal(badBase.status, 400);
     const preflight = await fetch(url + "/api/trips/trip", { method: "OPTIONS", headers: {
       origin: "http://localhost:8081", "access-control-request-method": "GET", "access-control-request-headers": "authorization,content-type,if-none-match",
     } });
@@ -97,9 +112,17 @@ test("API rejects malformed writes, permits polling preflight, and protects invi
     assert.equal(claim.body.members.find((member: { id: string }) => member.id === "c").userId, "outsider");
     const reclaimed = await request(`/api/join/${create.body.code}`, { claimMemberId: "c" }, "POST", "another");
     assert.equal(reclaimed.status, 409);
+    // Invite lookups are limited per client and answer 429 with Retry-After.
+    resetRateLimits();
+    for (let i = 0; i < 30; i++) assert.equal((await request("/api/join/NOSUCHCODE", undefined, "GET")).status, 404);
+    const limited = await fetch(url + "/api/join/NOSUCHCODE", { headers: { authorization: "Bearer owner" } });
+    assert.equal(limited.status, 429);
+    assert.ok(Number(limited.headers.get("retry-after")) >= 1);
   } finally {
     server.closeAllConnections();
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    store.close();
+    rateLimiter.close();
     process.chdir(cwd);
     await rm(scratch, { recursive: true, force: true });
   }

@@ -19,6 +19,16 @@ function supabaseErrorStatus(code?: string) {
   return 500;
 }
 
+/**
+ * Whether upsert_expense rejected the edit because p_base_rev no longer matches.
+ * The RPC isn't in this repo (see README), so this recognises the usual signals:
+ * a serialization failure (40001) or a message naming a stale revision/conflict.
+ * Align it with the deployed function.
+ */
+export function isRevisionConflict(error: { code?: string; message?: string }) {
+  return error.code === "40001" || /stale|conflict|revision mismatch|base_rev/i.test(error.message ?? "");
+}
+
 async function withDirectSupabase<T>(operation: () => Promise<T>, fallback: () => Promise<T>): Promise<T> {
   if (!directModeEnabled) return fallback();
 
@@ -107,6 +117,7 @@ function toExpense(row: Record<string, any>): Expense {
     needsReview: Boolean(row.needs_review ?? false),
     createdAt: toTimestamp(row.created_at ?? row.createdAt),
     updatedAt: toTimestamp(row.updated_at ?? row.updatedAt),
+    revision: Number.isInteger(row.revision) ? row.revision : undefined,
   };
 }
 
@@ -313,10 +324,20 @@ export const supabaseData = {
           needs_review: expense.needsReview ?? false,
           updated_at: new Date(expense.updatedAt).toISOString(),
         },
-        p_base_rev: null,
+        p_base_rev: expense.revision ?? null,
       });
 
-      if (error) throw new ApiError(error.message, supabaseErrorStatus(error.code));
+      if (error) {
+        if (isRevisionConflict(error)) {
+          // The RPC refused a stale edit; hand back the current copy so the user can review.
+          const latest = await supabaseData.getTrip(id).catch(() => null);
+          const current = latest?.expenses.find((candidate) => candidate.id === expense.id) ?? null;
+          throw new ApiError(error.message, 409, false, {
+            code: current ? "expense_conflict" : "expense_deleted", current,
+          });
+        }
+        throw new ApiError(error.message, supabaseErrorStatus(error.code));
+      }
       const trip = await supabaseData.getTrip(id);
       if (!trip) throw new ApiError("Trip not found", 404);
       return trip;

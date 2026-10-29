@@ -2,6 +2,7 @@ import { Alert } from "../../../lib/alert";
 import { router, Stack, useFocusEffect, useLocalSearchParams } from "expo-router";
 import { memo, useCallback, useMemo, useState } from "react";
 import { FlatList, Image, Pressable, Text, View, type ListRenderItem } from "react-native";
+import { ExpenseConflicts } from "../../../components/ExpenseConflicts";
 import { InviteSheet } from "../../../components/InviteSheet";
 import { PendingReceipts } from "../../../components/PendingReceipts";
 import { Banner, Button, Card, Chip, CurrencyPicker, Input, useTheme } from "../../../components/ui";
@@ -19,6 +20,7 @@ import {
   useStorageError,
   useSyncError,
   usePendingCount,
+  useConflicts,
   useFailedCount,
   useRecoveredCount,
   useTrip,
@@ -87,11 +89,12 @@ function TripView({ trip }: { trip: Trip }) {
 
 function TripContent({ trip, ledger }: { trip: Trip; ledger: Ledger }) {
   const { colors, styles } = useTheme();
-  const { addMember, removeTripLocally, claimTripMember, setHomeCurrency, queueReceipt, retryFailed, discardFailed } = useTripActions();
+  const { addMember, removeTripLocally, claimTripMember, setHomeCurrency, queueReceipt, retryFailed, discardFailed, resolveConflict } = useTripActions();
   const { user, displayName: authName, avatarUrl: authAvatar } = useAuth();
   const me = useMe(trip.id);
   const pending = usePendingCount(trip.id);
   const failed = useFailedCount(trip.id);
+  const conflicts = useConflicts(trip.id);
   const recovered = useRecoveredCount(trip.id);
   const online = useOnline();
   const syncError = useSyncError(trip.id);
@@ -167,6 +170,7 @@ function TripContent({ trip, ledger }: { trip: Trip; ledger: Ledger }) {
 
   const header = (
     <>
+      <ExpenseConflicts trip={trip} conflicts={conflicts} onResolve={(c, choice) => resolveConflict(c.tripId, c.expenseId, choice)} />
       {(pending > 0 || failed > 0 || !online || !!syncError || storageError) && (
         <Banner>
           {storageError

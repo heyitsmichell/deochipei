@@ -10,6 +10,7 @@ import {
   Text,
   View,
 } from "react-native";
+import { describeExpense } from "../../../components/ExpenseConflicts";
 import { Banner, Button, Card, Chip, CurrencyPicker, Field, Input, Label, useTheme } from "../../../components/ui";
 import { api, ApiError } from "../../../lib/api";
 import { findDuplicate, type DuplicateMatch } from "../../../lib/duplicates";
@@ -96,7 +97,7 @@ export default function ExpenseScreen() {
 
 function ExpenseEditor({ trip, expenseId, scan, queuedId }: Params & { trip: Trip }) {
   const { colors, styles } = useTheme();
-  const { saveExpense, saveChanges, deleteExpense, queueReceipt, discardReceipt, refresh, getTrip } = useTripActions();
+  const { saveExpense, saveChanges, deleteExpense, queueReceipt, discardReceipt, refresh, getTrip, staleExpense } = useTripActions();
   const me = useMe(trip.id);
   const settings = useSettings();
   const receipts = useQueuedReceipts();
@@ -429,7 +430,7 @@ function ExpenseEditor({ trip, expenseId, scan, queuedId }: Params & { trip: Tri
     [splitType, effectiveReceipt, amount, paidBy, split, currency, rate, trip.baseCurrency],
   );
 
-  const handleCommit = async () => {
+  const handleCommit = async (overwriteConfirmed = false) => {
     if (savingRef.current) return;
     savingRef.current = true;
     setSaving(true);
@@ -448,7 +449,20 @@ function ExpenseEditor({ trip, expenseId, scan, queuedId }: Params & { trip: Tri
         split,
         receipt: effectiveReceipt,
       });
-      saveExpense(trip.id, expense);
+      // Someone else saved this expense while the form was open: say so rather than overwrite them.
+      const newer = staleExpense(trip.id, expense);
+      if (newer && !overwriteConfirmed) {
+        Alert.alert(
+          "This expense changed",
+          `Someone else updated it while you were editing:\n\n${describeExpense(newer, trip)}\n\nSaving now replaces their version with yours.`,
+          [
+            { text: "Cancel", style: "cancel" },
+            { text: "Replace theirs", style: "destructive", onPress: () => void handleCommit(true) },
+          ],
+        );
+        return;
+      }
+      saveExpense(trip.id, newer ? { ...expense, revision: newer.revision } : expense);
       await saveChanges();
       if (queued) await discardReceipt(queued.id);
       router.back();
@@ -479,7 +493,7 @@ function ExpenseEditor({ trip, expenseId, scan, queuedId }: Params & { trip: Tri
         `${name(duplicateOf.paidBy)} already added what looks like this receipt. Adding it again charges the trip twice.`,
         [
           { text: "Cancel", style: "cancel" },
-          { text: "Add anyway", style: "destructive", onPress: handleCommit },
+          { text: "Add anyway", style: "destructive", onPress: () => void handleCommit() },
         ],
       );
       return;
@@ -810,6 +824,8 @@ function createExpenseRecord(params: {
     split: params.split,
     receipt: params.receipt,
     ...(params.existing?.createdBy ? { createdBy: params.existing.createdBy } : {}),
+    // The version this edit started from; the server refuses the save if someone changed it since.
+    ...(params.existing?.revision != null ? { revision: params.existing.revision } : {}),
     createdAt: params.existing?.createdAt ?? params.queued?.capturedAt ?? now,
     updatedAt: now,
   };

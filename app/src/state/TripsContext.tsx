@@ -8,7 +8,7 @@ import { rateService } from "../lib/rates";
 import { receiptFiles } from "../lib/receiptFiles";
 import type { Trip } from "../lib/types";
 import { ReceiptQueue } from "./ReceiptQueue";
-import { TripRepository, type RepositorySnapshot } from "./TripRepository";
+import { TripRepository, type ExpenseConflict, type RepositorySnapshot } from "./TripRepository";
 
 export type { Settings } from "./TripRepository";
 export type { QueuedReceipt } from "./ReceiptQueue";
@@ -52,6 +52,8 @@ const actions = {
   removeDamagedExpense: repository.removeDamagedExpense,
   retryFailed: repository.retryFailed,
   discardFailed: repository.discardFailed,
+  resolveConflict: repository.resolveConflict,
+  staleExpense: repository.staleExpense,
   removeTripLocally: repository.removeTripLocally,
   refresh: repository.refresh,
   retryAccountRestore: repository.retryAccountRestore,
@@ -136,6 +138,12 @@ export const usePendingCount = (tripId: string) =>
 
 export const useFailedCount = (tripId: string) =>
   useRepository((s) => s.data.failedOps.reduce((n, op) => (op.tripId === tripId ? n + 1 : n), 0));
+
+/** Edits to shared expenses that someone else changed first; they wait for a choice. */
+export function useConflicts(tripId: string): ExpenseConflict[] {
+  const all = useRepository((s) => s.data.conflicts);
+  return useMemo(() => (all ?? []).filter((c) => c.tripId === tripId), [all, tripId]);
+}
 
 /** All trips on this phone, most recently changed first. */
 export function useTripList() {

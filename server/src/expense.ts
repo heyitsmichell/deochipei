@@ -29,6 +29,7 @@ export const ExpenseSchema = z.looseObject({
     tax: z.number().finite().nullable().optional(), tip: z.number().finite().nullable().optional(), serviceCharge: z.number().finite().nullable().optional(),
   }).optional(),
   createdAt: z.number().finite(), updatedAt: z.number().finite(),
+  revision: z.number().int().nonnegative().optional(),
 }).superRefine((expense, ctx) => {
   if (expense.split.type !== "items") return;
   const items = expense.receipt?.items;
