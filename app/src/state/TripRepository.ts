@@ -126,6 +126,12 @@ export class TripRepository {
       if (request !== this.accountRequest) return;
       this.update((data) => ({ ...data, accountId: id }));
       this.accountId = id;
+      // Guest mode has no server sync to fail; a previous account's failure
+      // must not make local-only trips look offline.
+      if (id === null) {
+        this.setOnline(true);
+        this.setSyncError("__account__", undefined);
+      }
       this.accountRestoreNeeded = !!id;
       if (cleanupFailed) throw cleanupError;
     });
@@ -162,6 +168,7 @@ export class TripRepository {
           this.setOnline(true);
           this.setSyncError("__account__", "Couldn't load your account trips. Try again.");
         } else {
+          this.setSyncError("__account__", "Couldn't load your account trips. Try again.");
           this.setOnline(false);
           // Keep same-account offline data and retry on reconnect.
         }

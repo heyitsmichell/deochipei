@@ -17,6 +17,7 @@ const network = new ExpoNetworkMonitor();
 const repository = new TripRepository(api, AsyncStorage);
 const receiptQueue = new ReceiptQueue({
   repo: repository,
+  canScan: repository.canSync,
   network,
   storage: AsyncStorage,
   files: receiptFiles,
@@ -30,7 +31,8 @@ const receiptQueue = new ReceiptQueue({
     }),
 });
 
-export const synchronizeAccount = (id: string | null) => repository.setAccount(id, receiptQueue.clearForAccount);
+export const synchronizeAccount = (id: string | null) =>
+  repository.setAccount(id, receiptQueue.clearForAccount).finally(() => receiptQueue.process());
 export const resetLocalAccountState = () => synchronizeAccount(null);
 
 /**

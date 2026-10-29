@@ -110,7 +110,7 @@ function TripView({ trip, paymentRequest }: { trip: Trip; paymentRequest?: Trans
 function TripContent({ trip, ledger, paymentRequest }: { trip: Trip; ledger: Ledger; paymentRequest?: Transfer }) {
   const { colors, styles } = useTheme();
   const { addMember, removeTripLocally, claimTripMember, setHomeCurrency, queueReceipt, retryFailed, discardFailed, resolveConflict, saveSettlement, deleteSettlement, patchTrip } = useTripActions();
-  const { user, displayName: authName, avatarUrl: authAvatar } = useAuth();
+  const { user, session, displayName: authName, avatarUrl: authAvatar } = useAuth();
   const me = useMe(trip.id);
   const pending = usePendingCount(trip.id);
   const failed = useFailedCount(trip.id);
@@ -120,6 +120,7 @@ function TripContent({ trip, ledger, paymentRequest }: { trip: Trip; ledger: Led
   const syncError = useSyncError(trip.id);
   const storageError = useStorageError();
   const network = useNetwork();
+  const syncOffline = !online && Boolean(trip.syncEnabled);
   const [tab, setTab] = useState<Tab>(paymentRequest ? "balances" : "expenses");
   const [adding, setAdding] = useState(false);
   const [newMember, setNewMember] = useState("");
@@ -159,6 +160,10 @@ function TripContent({ trip, ledger, paymentRequest }: { trip: Trip; ledger: Led
 
   // No connection: keep the photo and read it later instead of opening the live scanner.
   const snapForLater = async () => {
+    if (!session) {
+      Alert.alert("Sign in required", "Sign in from Settings before scanning receipts.");
+      return;
+    }
     try {
       const picked = await pickReceiptImage("camera");
       if (picked) await queueReceipt(trip.id, picked.uri);
@@ -191,7 +196,7 @@ function TripContent({ trip, ledger, paymentRequest }: { trip: Trip; ledger: Led
   const header = (
     <>
       <ExpenseConflicts trip={trip} conflicts={conflicts} onResolve={(c, choice) => resolveConflict(c.tripId, c.expenseId, choice)} />
-      {(pending > 0 || failed > 0 || !online || !!syncError || storageError) && (
+      {(pending > 0 || failed > 0 || syncOffline || !!syncError || storageError) && (
         <Banner>
           {storageError
             ? "Local storage is unavailable; changes will not survive until it recovers."
@@ -467,13 +472,17 @@ function TripContent({ trip, ledger, paymentRequest }: { trip: Trip; ledger: Led
         }}
       >
         <Button
-          title={network.connected ? "📷 Scan receipt" : "📷 Snap for later"}
+          title={!session ? "🔒 Sign in to scan" : network.connected ? "📷 Scan receipt" : "📷 Snap for later"}
           style={{ flex: 1.4 }}
-          onPress={() =>
-            network.connected
-              ? router.push({ pathname: "/trip/[id]/expense", params: { id: trip.id, scan: "camera" } })
-              : snapForLater()
-          }
+          onPress={() => {
+            if (!session) {
+              Alert.alert("Sign in required", "Sign in from Settings before scanning receipts.");
+            } else if (network.connected) {
+              router.push({ pathname: "/trip/[id]/expense", params: { id: trip.id, scan: "camera" } });
+            } else {
+              void snapForLater();
+            }
+          }}
         />
         <Button
           title="+ Manual"

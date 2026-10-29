@@ -15,6 +15,7 @@ export default function TripsScreen() {
   const unverified = useUnverifiedCount();
   const accountError = useSyncError("__account__");
   const { retryAccountRestore } = useTripActions();
+  const hasSyncedTrips = trips.some((trip) => trip.syncEnabled);
 
   if (!ready) {
     return (
@@ -42,7 +43,7 @@ export default function TripsScreen() {
             <Text style={{ color: colors.warning }}>{accountError}</Text>
             <Button title="Retry loading trips" variant="secondary" onPress={() => void retryAccountRestore()} />
           </View>}
-          {!online && (
+          {!online && hasSyncedTrips && !accountError && (
             <Text style={{ color: colors.warning, marginTop: 8 }}>
               Offline — changes will sync when you reconnect. Receipts you snap are read once you&apos;re on Wi-Fi.
             </Text>

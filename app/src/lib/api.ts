@@ -29,35 +29,47 @@ export const INVITE_URL = process.env.EXPO_PUBLIC_INVITE_URL?.replace(/\/$/, "")
 
 export { ApiError };
 
-async function request<T>(path: string, init?: RequestInit & { timeoutMs?: number }): Promise<T> {
+async function request<T>(path: string, init?: RequestInit & { timeoutMs?: number; requiresAuth?: boolean }): Promise<T> {
+  const { timeoutMs = 10000, requiresAuth = false, ...requestInit } = init ?? {};
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), init?.timeoutMs ?? 10000);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const headers: Record<string, string> = {
       "content-type": "application/json",
       ...(init?.headers as Record<string, string> | undefined),
     };
 
+    let authenticated = false;
     try {
       const {
         data: { session },
       } = await supabase.auth.getSession();
       if (session?.access_token) {
         headers["Authorization"] = "Bearer " + session.access_token;
+        authenticated = true;
       }
     } catch {
       // In offline or testing mode where session retrieval fails, proceed without header
     }
 
+    if (requiresAuth && !authenticated) {
+      throw new ApiError("Sign in to scan receipts.", 401, false, { code: "auth_required" });
+    }
+
     const res = await fetch(API_URL + path, {
-      ...init,
+      ...requestInit,
       signal: controller.signal,
       headers,
     });
     // Only a conditional GET (getTrip with a known version) gets this, and it has no body.
     if (res.status === 304) return null as T;
     const body = await res.json().catch(() => ({}));
-    if (!res.ok) throw new ApiError(body.error ?? `Request failed (${res.status})`, res.status, body.retryable, body);
+    if (!res.ok) {
+      const message = requiresAuth && res.status === 401
+        ? "Your sign-in expired. Sign in again to scan receipts."
+        : body.error ?? `Request failed (${res.status})`;
+      throw new ApiError(message, res.status, body.retryable, body);
+    }
     return body as T;
   } finally {
     clearTimeout(timer);
@@ -114,12 +126,14 @@ const legacyApi = {
       body: JSON.stringify({ imageBase64, mediaType: "image/jpeg", targetLanguage }),
       // Reading a long foreign-language receipt can take a while.
       timeoutMs: 120000,
+      requiresAuth: true,
     }),
   checkDuplicate: (check: DuplicateCheckRequest) =>
     request<DuplicateVerdict>("/api/check-duplicate", {
       method: "POST",
       body: JSON.stringify(check),
       timeoutMs: 60000,
+      requiresAuth: true,
     }),
 };
 

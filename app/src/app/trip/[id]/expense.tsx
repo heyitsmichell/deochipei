@@ -14,6 +14,7 @@ import { ReceiptItems } from "../../../components/expense/ReceiptItems";
 import { ShareWeights } from "../../../components/expense/ShareWeights";
 import { ItemizedShareBreakdown, ShareSummary } from "../../../components/expense/SplitPreview";
 import { Banner, Button, Card, Chip, CurrencyPicker, Field, Input, Label, useTheme } from "../../../components/ui";
+import { useAuth } from "../../../context/AuthContext";
 import { api, ApiError } from "../../../lib/api";
 import { findDuplicate, type DuplicateMatch } from "../../../lib/duplicates";
 import { createExpenseRecord } from "../../../lib/expenseDraft";
@@ -99,6 +100,7 @@ export default function ExpenseScreen() {
 
 function ExpenseEditor({ trip, expenseId, scan, queuedId }: Params & { trip: Trip }) {
   const { colors, styles } = useTheme();
+  const { session } = useAuth();
   const { saveExpense, saveChanges, deleteExpense, queueReceipt, discardReceipt, refresh, getTrip, staleExpense } = useTripActions();
   const me = useMe(trip.id);
   const settings = useSettings();
@@ -225,6 +227,10 @@ function ExpenseEditor({ trip, expenseId, scan, queuedId }: Params & { trip: Tri
   };
 
   const runScan = async (source: ImageSource) => {
+    if (!session) {
+      Alert.alert("Sign in required", "Sign in from Settings before scanning receipts.");
+      return;
+    }
     let picked;
     try {
       picked = await pickReceiptImage(source);

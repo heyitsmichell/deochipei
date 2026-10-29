@@ -1,6 +1,7 @@
 import { Alert } from "../lib/alert";
 import { router } from "expo-router";
 import { ActivityIndicator, Image, Pressable, Text, View } from "react-native";
+import { useAuth } from "../context/AuthContext";
 import { formatMoney } from "../lib/money";
 import type { NetworkStatus } from "../lib/network";
 import {
@@ -18,12 +19,14 @@ export function PendingReceipts({ tripId }: { tripId: string }) {
   const { colors, styles } = useTheme();
   const { retryReceipt, readReceiptsNow, discardReceipt } = useTripActions();
   const queued = useTripReceipts(tripId);
+  const { session } = useAuth();
   const network = useNetwork();
   const settings = useSettings();
   if (!queued.length) return null;
 
   const onData = (r: QueuedReceipt) => r.allowCellular || settings.scanQueuedOnCellular;
-  const heldForWifi = network.connected && network.cellular && queued.some((r) => r.status === "waiting" && !onData(r));
+  const needsSignIn = !session && queued.some((r) => r.status === "waiting");
+  const heldForWifi = Boolean(session && network.connected && network.cellular && queued.some((r) => r.status === "waiting" && !onData(r)));
 
   const discard = (r: QueuedReceipt) =>
     Alert.alert("Discard this receipt?", "The photo will be deleted from this phone.", [
@@ -39,6 +42,8 @@ export function PendingReceipts({ tripId }: { tripId: string }) {
       <Text style={[styles.muted, { marginBottom: 4 }]}>
         {queued.every((r) => r.status === "failed" || r.status === "duplicate")
           ? "These couldn't be added automatically. Check each one below."
+          : needsSignIn
+            ? "Sign in from Settings to read these receipts. The photos stay on this phone."
           : !network.connected
             ? "Saved on this phone. They'll be read and added for everyone once you're on Wi-Fi."
             : heldForWifi
@@ -128,6 +133,7 @@ function DuplicateNote({ receipt: r, tripId }: { receipt: QueuedReceipt; tripId:
 
 function ReceiptStatus({ receipt: r, network, onData }: { receipt: QueuedReceipt; network: NetworkStatus; onData: boolean }) {
   const { colors, styles } = useTheme();
+  const { session } = useAuth();
   if (r.status === "reading") {
     return (
       <View style={{ flexDirection: "row", gap: 6, alignItems: "center" }}>
@@ -148,6 +154,8 @@ function ReceiptStatus({ receipt: r, network, onData }: { receipt: QueuedReceipt
   }
   const text = !network.connected
     ? "Waiting for a connection"
+    : !session
+      ? "Sign in to read"
     : network.cellular && !onData
       ? "Waiting for Wi-Fi"
       : r.error

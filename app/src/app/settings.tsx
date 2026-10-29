@@ -5,7 +5,7 @@ import { Button, Card, Chip, CurrencyPicker, Field, useTheme } from "../componen
 import { useAuth } from "../context/AuthContext";
 import { API_URL } from "../lib/api";
 import type { ThemePreference } from "../lib/types";
-import { useOnline, useQueuedReceipts, useSettings, useTripActions } from "../state/TripsContext";
+import { useNetwork, useOnline, useQueuedReceipts, useSettings, useTripActions } from "../state/TripsContext";
 
 const LANGUAGES = [
   "English",
@@ -36,6 +36,7 @@ export default function SettingsScreen() {
   const [signingIn, setSigningIn] = useState<"google" | "apple" | null>(null);
   const settings = useSettings();
   const online = useOnline();
+  const network = useNetwork();
   const receipts = useQueuedReceipts();
   const [custom, setCustom] = useState(
     LANGUAGES.includes(settings.receiptLanguage) ? "" : settings.receiptLanguage,
@@ -201,7 +202,15 @@ export default function SettingsScreen() {
       <Card>
         <Text style={styles.h2}>Sync server</Text>
         <Text style={styles.muted}>{API_URL}</Text>
-        <Text style={[styles.muted, { marginTop: 4 }]}>{online ? "Connected" : "Not reachable right now"}</Text>
+        <Text style={[styles.muted, { marginTop: 4 }]}>
+          {!user
+            ? "Sign in to sync trips across devices"
+            : network.connected
+              ? online
+                ? "Connected"
+                : "Server not reachable right now"
+              : "No network connection"}
+        </Text>
       </Card>
     </ScrollView>
   );

@@ -264,6 +264,20 @@ test("sign-out hides account trips even if receipt cleanup cannot be persisted",
   assert.equal(repo.canSync(), false);
 });
 
+test("signing out returns to online guest mode after a failed account restore", async () => {
+  const repo = new TripRepository(
+    { listTrips: async () => { throw new Error("server unreachable"); } } as TripApi,
+    new MemoryStorage(),
+    "repo",
+  );
+  await repo.setAccount("owner");
+  assert.equal(repo.getSnapshot().online, false);
+  assert.match(repo.getSnapshot().syncErrors.__account__, /Couldn't load/);
+  await repo.setAccount(null);
+  assert.equal(repo.getSnapshot().online, true);
+  assert.equal(repo.canSync(), false);
+});
+
 test("permanent restore errors stay online and wait for an explicit retry", { timeout: 2000 }, async () => {
   let calls = 0;
   let permanent = true;

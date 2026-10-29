@@ -1,11 +1,7 @@
 import * as Network from "expo-network";
+import { networkStatus, type NetworkStatus } from "./networkState";
 
-export interface NetworkStatus {
-  /** Some connection is up. It may still not reach the internet (hotel Wi-Fi login pages). */
-  connected: boolean;
-  /** On mobile data, where uploading photos can be slow or cost money while roaming. */
-  cellular: boolean;
-}
+export type { NetworkStatus } from "./networkState";
 
 export interface NetworkMonitor {
   current(): NetworkStatus;
@@ -24,6 +20,7 @@ export class ExpoNetworkMonitor implements NetworkMonitor {
     this.subscription = Network.addNetworkStateListener((state) => this.set(state));
     Network.getNetworkStateAsync()
       .then((state) => this.set(state))
+      // A failure to read the radio state must not leave the app stuck offline.
       .catch(() => {});
   }
 
@@ -42,10 +39,7 @@ export class ExpoNetworkMonitor implements NetworkMonitor {
   };
 
   private set(state: Network.NetworkState) {
-    const next = {
-      connected: state.isConnected !== false && state.isInternetReachable !== false,
-      cellular: state.type === Network.NetworkStateType.CELLULAR,
-    };
+    const next = networkStatus(state);
     if (next.connected === this.status.connected && next.cellular === this.status.cellular) return;
     this.status = next;
     for (const listener of this.listeners) listener();

@@ -41,6 +41,8 @@ export interface QueuedReceipt {
 
 export interface ReceiptQueueDeps {
   repo: Pick<TripRepository, "ready" | "getTrip" | "meFor" | "saveExpense" | "saved" | "getSnapshot" | "refresh" | "canSync" | "hasUnverifiedTrip">;
+  /** Whether the current account can use the authenticated receipt scanner. */
+  canScan?: () => boolean;
   network: NetworkMonitor;
   storage: KeyValueStorage;
   files: ReceiptFileStore;
@@ -280,7 +282,7 @@ export class ReceiptQueue {
 
   private mayRead(item: QueuedReceipt) {
     if (this.deps.repo.hasUnverifiedTrip(item.tripId)) return false;
-    if (this.deps.repo.getTrip(item.tripId)?.syncEnabled && !this.deps.repo.canSync()) return false;
+    if (this.deps.canScan && !this.deps.canScan()) return false;
     const { connected, cellular } = this.deps.network.current();
     if (!connected || (item.retryAt ?? 0) > Date.now()) return false;
     return !cellular || item.allowCellular || this.settings.scanQueuedOnCellular;
@@ -307,6 +309,10 @@ export class ReceiptQueue {
       try {
         scan = await this.deps.scan(image, this.settings.receiptLanguage);
       } catch (err) {
+        if (err instanceof ApiError && err.code === "auth_required") {
+          this.patch(item.id, { status: "waiting", error: err.message, retryAt: undefined });
+          return "stop";
+        }
         // Not a receipt, or the reader declined it: trying again won't change that.
         if (err instanceof ApiError && err.isPermanent) return this.fail(item, err.message);
         // Server busy or down: back off, and leave the rest of the queue for later too.
